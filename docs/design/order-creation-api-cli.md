@@ -31,11 +31,11 @@ caller explicitly forces a re-order.
    to fall over above that) without forcing the caller to hold a connection
    open for minutes.
 4. **Validate order parameters inline, on every order** — group-name
-   policy/format, requester permission to own the group, and target
-   OU/container validity are checked as the first step of placing the order
-   (single, small-batch, or each line of a bulk job); a standalone dry-run
-   call (§3.2) is *available* for a caller who wants to check before
-   committing, but is optional, not a prerequisite.
+   policy/format and both `primary_owner`/`secondary_owner` being valid,
+   permitted, distinct AD principals are checked as the first step of
+   placing the order (single, small-batch, or each line of a bulk job); a
+   standalone dry-run call (§3.2) is *available* for a caller who wants to
+   check before committing, but is optional, not a prerequisite.
 5. **Look up an order by order number *or* by group name**, and see its
    status — `succeeded` (with the order number), `validation_failed` (with
    the specific reason, e.g. which field and why), `failed` (with a
@@ -50,10 +50,13 @@ caller explicitly forces a re-order.
    number or by group name.
 
 ### Non-functional constraints
-- **Latency** — single-order create: p99 < 1.5s end-to-end (including the
-  prevalidation checks the server itself still runs — see §3). Bulk
-  submission is *accepted* in < 2s regardless of batch size; the batch itself
-  is processed asynchronously.
+- **Latency** — bounded by the 100/min downstream rate limit (§2), not a flat
+  number: a single order should complete in ~1.5s p99 (one rate-limit token
+  wait + one AD call); an N-order synchronous batch (N ≤ 25) scales as
+  ≈N × 0.6s + AD latency — still one request/response, no polling, but
+  callers should expect seconds, not milliseconds, once N > 1. Bulk
+  submission is *accepted* in < 2s regardless of batch size; the batch
+  itself is processed asynchronously against the same shared rate limit.
 - **Throughput / batch ceiling** — up to 4,500 order lines per logical
   submission, and the system should not need a redesign for a moderately
   higher ceiling (see §8).
@@ -74,8 +77,9 @@ caller explicitly forces a re-order.
 
 ### Out of scope (explicitly)
 - The AD/directory provisioning engine itself (the actual LDAP/Graph-API
-  calls that create the group object, set its owner, add members) — treated
-  as an existing downstream service this API calls.
+  calls that create the group object and set its `primary_owner`/
+  `secondary_owner`) — treated as an existing downstream service this API
+  calls.
 - Group **lifecycle after creation** — membership changes, renaming,
   deletion, ownership transfer. This design only covers *ordering the
   creation*.
@@ -89,48 +93,59 @@ caller explicitly forces a re-order.
   directory for this pass (see §8 for what changes).
 
 ### Assumptions (stated, revisable)
-- **Group name is the natural dedupe key** — it's unique within the target
-  AD domain/OU, so "has this group already been ordered" is answered by
-  looking up the group name, not a separate client-supplied id. (If multiple
-  directories/domains are in play, the key is `(domain, group_name)` — noted
-  in §5.)
+- **Single AD domain.** Everything in this design targets one directory —
+  `group_name` alone is the dedupe/lookup key (no domain qualifier needed).
+- **Group name is the natural dedupe key** — it's unique in that domain, so
+  "has this group already been ordered" is answered by looking up the group
+  name, not a separate client-supplied id.
 - Callers are trusted server-to-server integrations (internal tools, service
   catalogs, or the CLI) — not untrusted public browser clients.
-- The downstream AD provisioning API is a network call with its own rate
-  limit, not infinitely scalable — this shapes §2 and §7.
-- Average order line (group name, type, description, owner, optional members)
-  is ~500 bytes as JSON.
+- **The AD provisioning system enforces a hard rate limit of 100 requests/
+  minute** (confirmed — see §2/§6), shared across every caller of this API,
+  not per-tenant. This is the dominant constraint on the whole design, more
+  than storage or compute.
+- Average order line (`group_name`, `primary_owner`, `secondary_owner`) is
+  ~150 bytes as JSON.
+- `secondary_owner` must be a different AD principal than `primary_owner` —
+  a governance assumption, not stated by the requirement; flagged in §9.
 
 ## 2. Scale estimates
 
 | Quantity | Value | Basis |
 |---|---|---|
 | Orders per submission | 1 – 4,500 | stated requirement |
-| Order line size (JSON) | ~500 B | group_name/type/description/owner/members |
-| 4,500-order payload, inline | ~2.3 MB | 4,500 × 500 B |
-| Downstream calls per order | 1–2 (create-group; optionally add-members) | pipeline in §3 |
+| Order line size (JSON) | ~150 B | `group_name` + `primary_owner` + `secondary_owner` |
+| 4,500-order payload, inline | ~0.7 MB | 4,500 × 150 B |
+| Downstream calls per order | 1 (create-group, owners set at creation) | pipeline in §3 |
 | Downstream call latency | p50 150 ms / p99 400 ms | assumed AD/Graph API SLA |
-| Assumed AD-provisioning quota | ~50–100 req/s per tenant/app registration | typical directory-API throttle — **confirm** |
-| Sequential time for 1 order | ~150–400 ms | 1 create call, +1 if members set |
-| Sequential time for 4,500 orders, 1 worker | ~11–30 min | unacceptable → must parallelize |
-| Time for 4,500 orders, bounded by 100 rps quota | ~45 s | 4,500 / 100 rps |
-| Concurrent bulk jobs to plan for | ~20 system-wide | assumption, revisit with real traffic |
-| In-flight line items at that concurrency | ~90,000 | 20 × 4,500 |
+| **AD-provisioning rate limit** | **100 requests/minute, system-wide** (confirmed, not per-tenant) | stated constraint — this API must self-throttle to it, not just retry on 429 |
+| Effective downstream throughput | ~1.67 req/s | 100 ÷ 60 |
+| Time for 1 order (steady state) | ~0.6 s wait for a token + ~150–400 ms AD call | rate limit, not AD latency, now dominates even a single order |
+| Time for a 3-order small batch | **~2–3 s** | ≈3 sequential token waits (~0.6s apart) + AD latency each |
+| Time for a 4,500-order bulk job | **~45 minutes** | 4,500 ÷ 100 per min — this is the number that matters, not a compute estimate |
+| Concurrent bulk jobs worth planning for | 1–2 | the 100/min budget is shared system-wide; more concurrent jobs don't finish faster, they just interleave against the same ceiling |
+| In-flight line items, worst case | ~4,500–9,000 | one or two max-size jobs in flight at once |
 
 **What the numbers force:**
-- A single order must **not** wait behind a bulk job — independent scheduling
-  lanes (→ §3/§4, `task-scheduling` priority queues), otherwise a 4,500-line
-  job occupying every worker starves single-order latency.
-- 4,500 orders cannot run one-at-a-time (11–30 min) — needs a **worker
-  pool**, but concurrency is capped by the **AD provisioning quota**, not our
-  own compute. Rate-limit workers to that budget rather than free-running
-  into 429/throttling responses (→ `resilience-failure`).
-- A ~2.3 MB inline JSON body is comfortably within gateway payload caps
-  today, but the bulk endpoint still supports a **file-based** ingestion path
-  (§3) so a future higher ceiling, or larger group objects (long member
-  lists), never forces a limit renegotiation.
-- 90,000 in-flight line items at peak means the job/line-item store, and its
-  `group_name` lookup index (§5), must be built for that write volume.
+- **The rate limit, not our own compute, is now the entire story.** A worker
+  pool doesn't make a 4,500-order job finish faster than ~45 minutes — more
+  workers just queue up against the same 100/min ceiling. The design need is
+  a **single, shared, accurately-enforced rate limiter** (one token bucket,
+  not "N workers each self-limiting," which would either double-count the
+  budget or under-use it) gating every call this API makes downstream (→
+  `resilience-failure`).
+- **A small batch is no longer "fast."** 3 sequential orders spaced ~0.6s
+  apart by the rate limit alone take 2–3s — real, but still one request/
+  response, no polling needed. The latency NFR below is restated per-item
+  rather than as a single flat p99 (see NFR).
+- **Sync calls must not queue behind a bulk job**, or a single order could
+  wait up to 45 minutes for a token consumed by someone else's big batch.
+  This makes the priority lane in §4 a **reserved slice of the 100/min
+  budget**, not just dispatch ordering (see §6).
+- The payload/storage numbers above are small enough that neither inline-vs-
+  upload ingestion (§3) nor the order store (§5) is a scaling concern at this
+  volume — the rate limit is the only real bottleneck, at every scale up to
+  and including 4,500.
 
 ## 3. API & CLI (entry points)
 
@@ -147,14 +162,19 @@ Every line — single order, batch line, or bulk-file row — is the same shape:
 ```json
 {
   "group_name": "GRP-Finance-ReadOnly",
-  "group_type": "security",            // security | distribution
-  "description": "Read-only access to Finance reports",
-  "owner": "alice@corp.com",           // AD principal that manages the group
-  "parent_ou": "OU=Groups,OU=Finance,DC=corp,DC=com",  // optional, defaults per policy
-  "members": ["bob@corp.com"],         // optional initial members
-  "force": false                       // optional, default false — see 3.3
+  "primary_owner": "alice@corp.com",     // AD principal, primary owner of the group
+  "secondary_owner": "bob@corp.com",     // AD principal, backup owner — must differ from primary_owner
+  "force": false                         // optional, default false — see 3.3
 }
 ```
+
+Just the three business fields plus the `force` control flag — no
+`group_type`, `description`, `parent_ou`, or `members`: with a single target
+domain (§1) and a fixed system-wide placement/type policy, there's nothing
+else for the caller to specify. Both owners are validated and set on the AD
+group at creation (§3.2/§4); which becomes the group's primary `managedBy`
+vs. a secondary owner is an AD-provisioning-API detail, not something this
+API's contract needs to expose beyond the two fields above.
 
 ### 3.2 Validation — runs on every order; also callable standalone
 
@@ -167,36 +187,39 @@ The same logic is also exposed standalone for a caller who wants to check
 
 ```
 POST /v1/orders:validate
-{ "group_name": "GRP-Finance-ReadOnly", "group_type": "security",
-  "owner": "alice@corp.com", "parent_ou": "OU=Groups,...,DC=com" }
+{ "group_name": "GRP-Finance-ReadOnly",
+  "primary_owner": "alice@corp.com", "secondary_owner": "bob@corp.com" }
 
 200 OK
 {
   "valid": false,
   "checks": {
-    "name_policy": { "ok": true },   // naming convention/format/length
-    "owner":       { "ok": true },   // owner is a valid, permitted AD principal
-    "parent_ou":   { "ok": true }    // OU exists and is writable by this caller
+    "name_policy":     { "ok": true },   // naming convention/format/length
+    "primary_owner":   { "ok": true },   // valid, permitted AD principal
+    "secondary_owner": { "ok": false, "code": "same_as_primary_owner" }
   },
-  "errors": [],
-  "duplicate": { "already_ordered": true, "existing_order_number": "ord_77190",
-                 "existing_status": "succeeded" }   // informational — would SKIP on order, not fail validation
+  "errors": [
+    { "field": "secondary_owner", "code": "same_as_primary_owner",
+      "message": "secondary_owner must be a different principal than primary_owner." }
+  ],
+  "duplicate": { "already_ordered": false }   // informational — would SKIP on order, not fail validation
 }
 ```
 
-- `name_policy`, `owner`, and `parent_ou` are the **blocking** checks: any
-  failing one is what the order pipeline reports as `validation_failed` — the
-  `errors` array (field/code/message, same shape as the API's standard error
-  envelope) is exactly what a `validation_failed` order response carries.
+- `name_policy`, `primary_owner`, and `secondary_owner` are the **blocking**
+  checks: any failing one is what the order pipeline reports as
+  `validation_failed` — the `errors` array (field/code/message, same shape as
+  the API's standard error envelope) is exactly what a `validation_failed`
+  order response carries.
 - `duplicate` is reported separately and is **not** a validation failure —
   ordering an already-ordered group isn't invalid input, it's a request the
   pipeline *skips* (req. 6, §3.3). It's included here only so a dry-run
   caller can see it coming.
 - Each blocking check is also independently reachable
-  (`POST /v1/validations/name-policy`, `/v1/validations/owner`,
-  `/v1/validations/parent-ou`) for callers that only need one. `orders:validate`
-  and the order pipeline's step 1 are **the same implementation** — "it
-  validated" and "it orders" can't drift apart.
+  (`POST /v1/validations/name-policy`, `/v1/validations/primary-owner`,
+  `/v1/validations/secondary-owner`) for callers that only need one.
+  `orders:validate` and the order pipeline's step 1 are **the same
+  implementation** — "it validated" and "it orders" can't drift apart.
 - The `duplicate` check here is **advisory**: it reflects our order store at
   read time. The authoritative check is the one the create path performs
   under the DB's unique constraint (§5) — a dry run showing "not a duplicate"
@@ -213,8 +236,8 @@ POST /v1/orders:validate
 ```
 POST /v1/orders
 Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
-{ "group_name": "GRP-Finance-ReadOnly", "group_type": "security",
-  "owner": "alice@corp.com", "parent_ou": "OU=Groups,...,DC=com" }
+{ "group_name": "GRP-Finance-ReadOnly",
+  "primary_owner": "alice@corp.com", "secondary_owner": "bob@corp.com" }
 
 201 Created
 { "order_number": "ord_88213", "status": "succeeded", "group_name": "GRP-Finance-ReadOnly" }
@@ -228,8 +251,8 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
   "reason": [
     { "field": "group_name", "code": "invalid_group_name",
       "message": "Group name may not contain '!' and must start with 'GRP-'." },
-    { "field": "parent_ou", "code": "invalid_parent_ou",
-      "message": "OU does not exist or is not writable by this caller." }
+    { "field": "secondary_owner", "code": "same_as_primary_owner",
+      "message": "secondary_owner must be a different principal than primary_owner." }
   ] }
 
 502 Bad Gateway   // input was valid, the group wasn't a duplicate — the downstream AD call itself failed
@@ -365,23 +388,30 @@ running server-side — `--watch` can be resumed against the same `job_id`).
                             │                      ▼
                             │            ┌──────────────────┐
                             └───────────▶│ Order pipeline    │  (shared code path §3.2/3.3)
-                                         │  1. validate (name-policy, owner,
-                                         │     parent_ou) → validation_failed
-                                         │     if any check fails, no AD call
-                                         │  2. duplicate check (unique         
-                                         │     constraint is authoritative)    
-                                         │     → skipped if already ordered   
-                                         │  3. AD group-create [+ add members]
-                                         │     → failed on downstream error   
-                                         │  4. persist order (succeeded/       
+                                         │  1. validate (name-policy,
+                                         │     primary_owner, secondary_owner)
+                                         │     → validation_failed if any
+                                         │     check fails, no AD call made
+                                         │  2. duplicate check (unique
+                                         │     constraint is authoritative)
+                                         │     → skipped if already ordered
+                                         │  3. acquire a token from the
+                                         │     shared 100/min rate limiter
+                                         │     (blocks/queues here, not on
+                                         │     AD's own 429s)
+                                         │  4. AD group-create (owners set)
+                                         │     → failed on downstream error
+                                         │  5. persist order (succeeded/
                                          │     validation_failed/failed/skipped)
                                          └────────┬──────────┘
                                                   ▼
                                      ┌────────────────────────┐
-                                     │ orders / order_jobs /   │
-                                     │ order_job_items store   │
-                                     └────────────────────────┘
-                                                  │
+                                     │ orders / order_jobs /   │      ┌───────────────────┐
+                                     │ order_job_items store   │      │ Shared rate limiter │
+                                     │ (single relational DB,  │◀────▶│ (100 req/min token  │
+                                     │ e.g. PostgreSQL — §5)   │      │ bucket, sync-        │
+                                     └────────────────────────┘      │ reserved slice)      │
+                                                  │                  └───────────────────┘
                                                   ▼
                                      ┌────────────────────────┐
                                      │ AD / directory          │  (downstream — out of scope, §1)
@@ -405,30 +435,52 @@ running server-side — `--watch` can be resumed against the same `job_id`).
 - **Line-item queue** has (at least) two lanes/priorities — sync-path calls
   don't sit behind a 4,500-line job (§2's fairness requirement) — a
   `task-scheduling` priority-queue concern, not a new component.
+- **Shared rate limiter** is the component §2's numbers actually demand: one
+  token bucket, refilled at 100/min, that every downstream AD call (sync or
+  bulk) acquires a token from before dispatch — not per-worker limiting,
+  which would either over- or under-count the real budget. A small slice of
+  the bucket is reserved for the sync lane (§6) so a big bulk job can't starve
+  single-order latency. Lives alongside the queue, not inside the DB.
 - **Blob store** exists only for the upload path (>500 lines) — a
   `blob-store` building block, not a bespoke file service.
+- **Order store** is a single relational database (PostgreSQL or equivalent)
+  — see §5 for why SQL, and why one instance is enough at this volume.
 
 ## 5. Data model
 
-- **`orders`** — PK `order_number`. Columns: group_name, group_type, owner,
-  parent_ou, status (`succeeded`|`validation_failed`|`failed`|`skipped`),
-  `validation_errors` (nullable array — field/code/message, populated only
-  when status is `validation_failed`), `error` (nullable object —
-  code/message/retryable, populated only when status is `failed`),
+**Storage engine: a single relational database (PostgreSQL or equivalent),
+one instance — not sharded, not NoSQL.** This is a deliberate `data-storage`
+call, not a default: the two correctness requirements this design leans on
+hardest — "don't order an already-ordered group" (req. 6) and "don't
+double-execute a retried request" — are both enforced by **unique
+constraints checked atomically at insert time** (below), which is exactly
+what a relational store gives for free and an eventually-consistent store
+would make genuinely hard to get right. And the volume never argues
+otherwise: §2 puts the *entire system* at ≤100 writes/minute by construction
+(the rate limit gates order creation itself) plus a bounded ~4.5–9k-row bulk
+job store per job in flight — trivial OLTP load for one instance, no
+sharding story needed, ever, at this design's scale (see §8).
+
+- **`orders`** — PK `order_number`. Columns: group_name, primary_owner,
+  secondary_owner, status (`succeeded`|`validation_failed`|`failed`|
+  `skipped`), `validation_errors` (nullable array — field/code/message,
+  populated only when status is `validation_failed`), `error` (nullable
+  object — code/message/retryable, populated only when status is `failed`),
   skipped_order_number (nullable — set when status is `skipped`, pointing at
   the order it deferred to), `job_id` (nullable — set when ordered via a bulk
   job), created_at.
-  - **Unique index on `(domain, group_name)` for rows where `status IN
-    ('succeeded', 'pending', 'processing')`** (a partial/filtered unique
-    index) — this is what makes "skip if already ordered" correct under
-    concurrency (req. 6/NFR): two concurrent orders for the same group name
-    race on this constraint, and only one wins the insert; the loser's
-    pipeline observes the conflict and returns `skipped` pointing at the
-    winner, rather than the app-level pre-check (§3.2) being trusted alone.
-    A `failed` order does **not** hold the constraint, so a genuinely failed
-    attempt (nothing was created) can be retried without being treated as a
-    duplicate — this is the default dedupe rule (§9 flags it as confirmable,
-    not a hard requirement from the prompt).
+  - **Unique index on `group_name` for rows where `status IN ('succeeded',
+    'pending', 'processing')`** (a partial/filtered unique index — single
+    domain, so no qualifier beyond the name itself, §1) — this is what makes
+    "skip if already ordered" correct under concurrency (req. 6/NFR): two
+    concurrent orders for the same group name race on this constraint, and
+    only one wins the insert; the loser's pipeline observes the conflict and
+    returns `skipped` pointing at the winner, rather than the app-level
+    pre-check (§3.2) being trusted alone. A `failed` order does **not** hold
+    the constraint, so a genuinely failed attempt (nothing was created) can
+    be retried without being treated as a duplicate — this is the default
+    dedupe rule (§9 flags it as confirmable, not a hard requirement from the
+    prompt).
   - Unique index on `(tenant_id, idempotency_key)` for the sync path's
     retry-safety dedupe (separate from the group-name dedupe above — one is
     "don't double-execute *this* request," the other is "don't order a group
@@ -453,13 +505,16 @@ running server-side — `--watch` can be resumed against the same `job_id`).
   state-machine (pending/complete, reject on same-key-different-body).
 
 Group-name lookup (`GET /v1/orders?group_name=...`, req. 5) is served by the
-`(domain, group_name)` index above — the same index that enforces the
-duplicate-skip rule, so "look up by group name" and "detect it's already
-ordered" are the same query, not two implementations to keep in sync.
+`group_name` index above — the same index that enforces the duplicate-skip
+rule, so "look up by group name" and "detect it's already ordered" are the
+same query, not two implementations to keep in sync.
 
-Sharding: not needed at this scale (§2's ~90k in-flight rows is a normal
-OLTP write volume); if it becomes one, `job_id` is the natural shard key for
-`order_job_items` since every access pattern here is job-scoped.
+Sharding: not needed, and not expected to ever be needed (§2/§8) — the
+100/min rate limit caps real order-creation write volume far below what a
+single instance handles trivially; `order_job_items`' ~4.5–9k-row bulk-job
+bursts are the largest write burst in the system and are still a normal OLTP
+load. If this were ever revisited, `job_id` is the natural shard key since
+every access pattern here is job-scoped.
 
 ## 6. Key decisions & trade-offs
 
@@ -468,23 +523,37 @@ OLTP write volume); if it becomes one, `job_id` is the natural shard key for
 | Validation is step 1 of the order pipeline (runs on every order call), not a required separate step | Callers can't forget to validate; a `validation_failed` reason is always in the order response itself, no extra round trip needed | The order call always pays validation cost, even for a line dry-run-checked moments earlier — no way to present a "trust me, already validated" token | Blocking checks become expensive enough that skipping a repeat check is worth the complexity → add an optional skip token then |
 | `validation_failed` and `failed` as distinct order statuses | A caller can branch on "fix the request" vs "safe to retry" without parsing error codes (req. 1/5) | One more status value in every enum/consumer (job counts, CLI filters, data model) | Never — this is exactly the distinction the requirement asks for |
 | Sync endpoint (≤25) + separate async job endpoint (up to 4,500+) | Keeps single-order latency low; lets bulk scale independently | Two code paths to keep behaviorally identical (mitigated: both call the same order pipeline, §4) | The sync cutover (25) is wrong for real traffic → tune, don't redesign |
-| `group_name` as the dedupe/business key (no separate `external_id`) | One fewer field to require from callers; "look up by group name" and "already ordered" share one index (§5) | Renaming a group later has no clean story here (out of scope, §1) — the key is fixed at order time | Group names can legitimately repeat across domains → key becomes `(domain, group_name)` (already the plan, §5) |
+| `group_name` as the dedupe/business key (no separate `external_id`) | One fewer field to require from callers; "look up by group name" and "already ordered" share one index (§5) | Renaming a group later has no clean story here (out of scope, §1) — the key is fixed at order time | A second domain is ever added → key must become `(domain, group_name)`, since §1 confirms single-domain today |
+| A single shared rate limiter (one 100/min token bucket), not per-worker limiting | Correctly enforces the real, confirmed constraint (§2) regardless of worker-pool size — adding workers can't accidentally over-spend the budget | Every call path (sync and bulk) now depends on one shared piece of state — it must be fast and available, or nothing can place an order (→ §7) | Never, while the limit is a single system-wide number; if AD ever exposes per-tenant quotas, the bucket becomes per-tenant |
+| A reserved slice of the 100/min budget for the sync lane (not just dispatch-order priority) | A big bulk job literally cannot starve single-order latency down to zero, even under the confirmed low ceiling (§2) | Reserved sync capacity is bulk capacity not spent — a max bulk job takes a little longer than the raw 45 min math (§2) | The real traffic mix shows sync calls are rare enough that a reservation wastes bulk throughput → shrink or drop it |
+| PostgreSQL (single relational instance) for the order store, not NoSQL | Atomic unique constraints are what make the group-name and idempotency-key dedupe (§5) correct under concurrency; the confirmed 100/min limit keeps volume trivial for one instance | A single writer to keep available (standard HA replica, not a novel problem here) | Never, at this design's scale (§8) — revisit only if `data-storage` scale numbers actually demand a distributed store |
 | Skip-by-default on duplicate, `force=true` to override | Prevents accidental re-ordering of an existing/in-flight group; caller still gets the original order number back (req. 5/6) | A caller who *meant* to retry a `failed` order must know failed orders aren't skipped by default (§5) — needs to be documented, not surprising | Business wants "already ordered" to include failed attempts too → widen the partial-unique-index predicate |
 | Duplicate check enforced by a **DB unique constraint**, not just the app-level `orders:validate` pre-check | Correct under concurrency — two racing submissions for the same group can't both succeed | The loser of the race gets its `skipped` result at insert time, not at validate time — slightly less "predictable" from the client's view | Never — this is the correctness backstop; relaxing it reopens the duplicate-group race |
 | `force=true` still goes through the real AD create call (not a bypass of AD's own uniqueness) | A forced re-order of a group AD still has fails cleanly with a clear error, never silently duplicates | `force` looks like it "always creates" but sometimes still fails — needs documenting | Never — bypassing AD's own check would let this API create actual duplicate directory objects |
 | Inline body (≤500 lines) *or* presigned-upload for bulk | Never hits a gateway payload ceiling as batch size grows | Two ingestion paths in the client/CLI to implement | Gateway payload limits change → could raise the inline threshold instead |
 | Idempotency-Key per order **and** per job, `group_name` per line | Safe retries at every granularity (single call, whole job, one line within a resumed job) | Two idempotency scopes plus the business-key dedupe to reason about | Never — this is what makes retries at any level safe |
-| Worker pool rate-limited to the AD provisioning quota (not just our own concurrency) | Bulk jobs finish in ~seconds-to-minutes instead of tens of minutes, without throttling storms against the directory API | Job completion time is capped by AD's quota, not ours | AD offers a real batch-create API → call that instead of N single calls |
+| Worker-pool size decoupled from throughput (concurrency just hides non-AD-call latency: validation, duplicate check, persist) | No wasted complexity sizing a large pool the rate limiter would throttle anyway | A 4,500-order job still takes ~45 min regardless of pool size (§2) — that's the confirmed limit, not a tuning knob | AD offers a real batch-create API → call that instead of N single calls, which is the only lever that actually changes completion time (§8) |
 | Priority lanes for sync vs. bulk line-item dispatch | A 4,500-line job can't starve single-order latency | Scheduler has to be lane-aware, not a plain FIFO queue | Traffic mix makes this moot (e.g. bulk becomes the only path) |
 
 ## 7. Failure modes & degradation
 
-- **Invalid input** (bad group-name format, unknown/unpermitted owner, a
-  parent OU that doesn't exist or isn't writable) — caught at step 1 of the
-  pipeline, before any downstream call is made. Returns `validation_failed`
-  with the specific field/code/message immediately (fast, cheap, and doesn't
-  consume any of the AD provisioning quota from §2) — this is the case the
+- **Invalid input** (bad group-name format, an unknown/unpermitted
+  `primary_owner` or `secondary_owner`, or the two owners being the same
+  principal) — caught at step 1 of the pipeline, before any downstream call
+  is made or any rate-limit token spent. Returns `validation_failed` with the
+  specific field/code/message immediately — this is the case the
   "validation happens as part of the order" requirement targets directly.
+- **The rate limiter itself is unavailable** (§4's shared token bucket is
+  down or unreachable) — this is now a real dependency every order goes
+  through, sync or bulk (§6). Fail closed: orders return a `retryable: true`
+  5xx rather than bypassing the limiter and risking a burst past the
+  confirmed 100/min ceiling. Run it as a small, highly-available component
+  (e.g. a replicated in-memory store) rather than folding it into the order
+  DB, so an order-store blip and a rate-limiter blip aren't the same failure.
+- **The sync lane's reserved token slice is exhausted** (a burst of small
+  batches) — `429` + `Retry-After`, same contract as any other rate limit
+  (`api-design`); the caller backs off and retries, it does not silently
+  fall back to consuming bulk-reserved tokens.
 - **AD provisioning API slow or down** — each call is wrapped in a timeout +
   circuit breaker (`resilience-failure`). Sync path: the order fails fast
   with a `retryable: true` 5xx rather than hanging. Bulk path: the breaker
@@ -524,8 +593,10 @@ OLTP write volume); if it becomes one, `job_id` is the natural shard key for
 - **What the user sees:** a sync call either succeeds, is cleanly skipped
   with the original order number, comes back `validation_failed` with the
   exact reason (their input, fixable, no AD call attempted), or comes back
-  `failed` with a retryable/non-retryable downstream error — always in
-  ≤1.5s. A bulk job always finishes in a *terminal* state visible via
+  `failed` with a retryable/non-retryable downstream error — in ~1.5s for a
+  single order, scaling predictably with batch size for a small batch (§1's
+  NFR), never an open-ended hang. A bulk job always finishes in a *terminal*
+  state visible via
   `GET /v1/order-jobs/{id}` (never "stuck"), with per-line detail for exactly
   the lines that were skipped, failed validation, or failed downstream —
   never an all-or-nothing rollback of 4,500 orders because of one bad group
@@ -533,25 +604,33 @@ OLTP write volume); if it becomes one, `job_id` is the natural shard key for
 
 ## 8. Scale evolution
 
-**Current bottleneck:** the AD/directory provisioning API's request quota
-(§2's ~50–100 rps assumption), not our own compute or storage — a 4,500-line
-job is already dominated by that, not by queue throughput.
+**Current bottleneck:** the confirmed **100 requests/minute** AD-provisioning
+rate limit (§2) — not our own compute or storage, and not even close. A
+4,500-order job is a **~45-minute** job purely from that number; nothing
+about workers, queues, or the database changes that.
 
-**At 10× (≈45,000 orders/submission):**
+**At 10× (≈45,000 orders/submission):** the arithmetic stops being tolerable
+— 45,000 ÷ 100/min is **~7.5 hours** for one job. This is not a "split into
+shards and add workers" problem, because concurrency was never the
+constraint (§2/§6):
 - The inline-body path disappears entirely (mandatory file upload above a
-  much lower line count than today's 500).
-- A single `order_jobs` row's line count stops being "a job" and becomes "a
-  job with shards" — split dispatch across multiple queue partitions keyed by
-  `job_id` so one giant job doesn't monopolize the worker pool.
-- The per-order downstream call becomes the real limiter — worth checking
-  whether the directory API offers a genuine **batch** group-create call
-  instead of 45,000 individual calls; if not, this API's own worker-pool
-  rate limiting is the only lever, and completion time scales linearly with
-  the quota, which becomes the number to renegotiate.
+  much lower line count than today's 500) — but that's a payload-size fix,
+  not a throughput fix.
+- The **only** lever that actually changes completion time is the rate limit
+  itself: renegotiate a higher quota, or — better — get a genuine **batch**
+  group-create call from the directory API (create N groups in one request,
+  counted as one unit against the limit rather than N). Splitting dispatch
+  across more queue partitions or workers does **nothing** here, unlike a
+  typical bulk-processing bottleneck — worth stating explicitly so a future
+  reader doesn't reach for "add more workers" first.
+- A job whose expected completion is hours, not minutes, also changes the
+  CLI/UX story (§3.5): `--wait` blocking a terminal for 7.5 hours is not
+  reasonable — `--watch` polling with a persisted `job_id` to resume against
+  becomes the primary flow, not a fallback for the interrupted case.
 - **Signal to watch:** job completion-time p95 climbing past a documented
-  SLA, or throttling responses from the directory API rising despite the
-  rate limiter — either means the quota assumption in §2 needs
-  renegotiating before volume grows further.
+  SLA, or the rate limiter's queue depth growing without bound — either means
+  the 100/min ceiling itself needs renegotiating before volume grows further,
+  not a scaling fix on this API's side.
 
 ## 9. Open questions
 
@@ -560,11 +639,6 @@ job is already dominated by that, not by queue throughput.
   `failed` without needing `force`. Confirm this matches intent — if a
   failed order should also require `force` to retry, the unique-index
   predicate in §5 changes from excluding `failed` to including everything.
-- **Cross-domain group names.** If the same `group_name` can legitimately
-  exist as separate groups in two different AD domains/forests, the dedupe
-  key must be `(domain, group_name)` (already planned in §5) — confirm
-  whether domain is always part of the order, or needs to be inferred from
-  `parent_ou`.
 - **Drift detection** (§1, out of scope): a group created directly in AD,
   bypassing this API, has no order record — `orders:validate`'s duplicate
   check won't see it, and a subsequent order would attempt creation and get
@@ -572,12 +646,20 @@ job is already dominated by that, not by queue throughput.
   clean `skipped`. Worth deciding whether that failure should be
   auto-reclassified as `skipped` once observed, or left as a failure for a
   human to reconcile.
-- Real AD provisioning quota — §2's 50–100 rps is an assumption; confirm
-  against the actual directory API's throttling limits before sizing the
-  worker pool for production.
-- Auth model (API key vs. OAuth client-credentials, and how `owner` is
-  authorized to receive a new group) — assumed but not designed; doesn't
-  change the shapes above either way.
+- **Is the 100/min limit truly one global ceiling**, or actually per
+  app-registration/service-principal in a way that would let a second
+  registration double the effective budget? This design assumes one shared
+  system-wide bucket (§2/§5/§6) as the safe/conservative reading — worth
+  confirming, since a per-registration limit would change the rate-limiter
+  design (multiple buckets, one per registration) and the §8 scale story.
+- **`secondary_owner != primary_owner`** — assumed as a governance rule
+  (§1), not stated in the requirement. Confirm whether it should actually be
+  enforced, and whether AD's own `owners` semantics distinguish "primary"
+  from "secondary" at all, or whether that distinction is purely this
+  system's metadata (§3.1).
+- Auth model (API key vs. OAuth client-credentials, and how `primary_owner`/
+  `secondary_owner` are authorized to receive a new group) — assumed but not
+  designed; doesn't change the shapes above either way.
 
 ---
 ### Validation (fill-in gate)
@@ -591,8 +673,11 @@ job is already dominated by that, not by queue throughput.
       exact group name, §3.4, not full-text search); logs/SLOs — deferred to
       `observability`/`distributed-logging`, not re-derived here.
 
-**Weakest dimension:** §9's two behavioral defaults (does "already ordered"
-include failed attempts; how cross-domain name collisions are keyed) are this
-design's own choices, not confirmed requirements — they're load-bearing on
-the unique-index shape in §5 and should be confirmed before implementation,
-not just before scale.
+**Weakest dimension:** §9's open questions are now the design's real risk
+surface — whether "already ordered" should include failed attempts, whether
+the 100/min limit is truly one global ceiling (vs. per-registration, which
+would reshape the rate-limiter design), and whether `secondary_owner !=
+primary_owner` should actually be enforced. None of these are scale
+questions anymore (§2/§8 are about as settled as a design can be once a hard
+rate limit is confirmed) — they're behavioral defaults this design chose and
+should be confirmed before implementation.
