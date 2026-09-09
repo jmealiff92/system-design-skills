@@ -20,22 +20,27 @@ caller explicitly forces a re-order.
 
 ### Functional requirements
 1. **Order a single group's creation**, synchronously, and get back an
-   **order number** plus final status (`succeeded` / `failed` / `skipped`) in
-   one round trip.
+   **order number** plus final status (`succeeded` / `validation_failed` /
+   `failed` / `skipped`) in one round trip — **validation happens as part of
+   placing the order**, not as a separate required call. If the parameters
+   don't pass, the order response itself comes back `validation_failed` with
+   the reason(s); nothing is sent downstream.
 2. **Order a small set of groups** (e.g. 2–3) in one call, each evaluated and
    reported independently — one bad group must not block the good ones.
 3. **Order a large batch of groups** (up to **4,500** in scope; designed not
    to fall over above that) without forcing the caller to hold a connection
    open for minutes.
-4. **Prevalidate order parameters** — group-name policy/format, requester
-   permission to own the group, target OU/container validity, and whether the
-   group has already been ordered — via dedicated calls the caller can make
-   *before* committing to order, for both a single group and a whole batch
-   (dry run).
+4. **Validate order parameters inline, on every order** — group-name
+   policy/format, requester permission to own the group, and target
+   OU/container validity are checked as the first step of placing the order
+   (single, small-batch, or each line of a bulk job); a standalone dry-run
+   call (§3.2) is *available* for a caller who wants to check before
+   committing, but is optional, not a prerequisite.
 5. **Look up an order by order number *or* by group name**, and see its
-   status — `succeeded` (with the order number), `failed` (with an error
-   message), or `skipped` (with the order number of the pre-existing order it
-   was skipped in favor of).
+   status — `succeeded` (with the order number), `validation_failed` (with
+   the specific reason, e.g. which field and why), `failed` (with a
+   downstream error message), or `skipped` (with the order number of the
+   pre-existing order it was skipped in favor of).
 6. **Skip duplicate orders.** If a group has already been ordered
    (successfully, or is currently in flight), a new order for the same group
    name is **skipped**, not re-attempted — *unless* the caller passes
@@ -63,9 +68,9 @@ caller explicitly forces a re-order.
   already-ordered line in a 4,500-line batch must not fail the other 4,499.
 - **Fairness** — a giant bulk job must not starve single-order latency for
   other callers; they are scheduled independently.
-- **Auditability** — every order's outcome (succeeded / failed / skipped, and
-  the exact error on failure) must be queryable after the fact by order
-  number *or* group name, not just streamed once.
+- **Auditability** — every order's outcome (succeeded / validation_failed /
+  failed / skipped, and the exact reason or error) must be queryable after
+  the fact by order number *or* group name, not just streamed once.
 
 ### Out of scope (explicitly)
 - The AD/directory provisioning engine itself (the actual LDAP/Graph-API
@@ -129,9 +134,11 @@ caller explicitly forces a re-order.
 
 ## 3. API & CLI (entry points)
 
-Three concerns, three endpoint families: **prevalidate**, **order**, **track**.
-All non-idempotent writes require `Idempotency-Key`; all list/results reads
-use cursor pagination (§`api-design`).
+Three concerns, three endpoint families: **validate**, **order**, **track**.
+Validation is not a separate step a caller must perform first — it's the
+first stage of the order pipeline itself (§4), run on every order call, and
+also independently reachable for a dry run. All non-idempotent writes require
+`Idempotency-Key`; all list/results reads use cursor pagination (§`api-design`).
 
 ### 3.1 The order object
 
@@ -149,10 +156,14 @@ Every line — single order, batch line, or bulk-file row — is the same shape:
 }
 ```
 
-### 3.2 Prevalidation — "would this order work?"
+### 3.2 Validation — runs on every order; also callable standalone
 
-A composite endpoint runs the same checks the create pipeline runs, without
-ordering anything:
+Validation is **step 1 of the order pipeline** (§4) — every call to
+`POST /v1/orders` or a bulk job line runs it automatically before anything
+else happens, and a failing check comes back as part of the order response
+itself (`status: "validation_failed"`, see §3.3), no separate call required.
+The same logic is also exposed standalone for a caller who wants to check
+*before* committing (e.g. a request form validating as the user types):
 
 ```
 POST /v1/orders:validate
@@ -163,30 +174,35 @@ POST /v1/orders:validate
 {
   "valid": false,
   "checks": {
-    "name_policy":  { "ok": true },                     // naming convention/format/length
-    "duplicate":    { "ok": false, "code": "already_ordered",
-                       "existing_order_number": "ord_77190", "existing_status": "succeeded" },
-    "owner":        { "ok": true },                      // owner is a valid, permitted AD principal
-    "parent_ou":    { "ok": true }                        // OU exists and is writable by this caller
+    "name_policy": { "ok": true },   // naming convention/format/length
+    "owner":       { "ok": true },   // owner is a valid, permitted AD principal
+    "parent_ou":   { "ok": true }    // OU exists and is writable by this caller
   },
-  "errors": [
-    { "field": "group_name", "code": "already_ordered",
-      "message": "GRP-Finance-ReadOnly was already ordered (ord_77190, succeeded)." }
-  ]
+  "errors": [],
+  "duplicate": { "already_ordered": true, "existing_order_number": "ord_77190",
+                 "existing_status": "succeeded" }   // informational — would SKIP on order, not fail validation
 }
 ```
 
-- Each check is also independently reachable (`POST /v1/validations/name-policy`,
-  `/v1/validations/duplicate`, `/v1/validations/owner`, `/v1/validations/parent-ou`)
-  for callers that only need one — e.g. a name field with live validation in a
-  request form. `orders:validate` orchestrates all four and is what the CLI's
-  `orders validate` and the create pipeline itself both call — **one code
-  path**, so "it validated" and "it orders" never drift apart.
+- `name_policy`, `owner`, and `parent_ou` are the **blocking** checks: any
+  failing one is what the order pipeline reports as `validation_failed` — the
+  `errors` array (field/code/message, same shape as the API's standard error
+  envelope) is exactly what a `validation_failed` order response carries.
+- `duplicate` is reported separately and is **not** a validation failure —
+  ordering an already-ordered group isn't invalid input, it's a request the
+  pipeline *skips* (req. 6, §3.3). It's included here only so a dry-run
+  caller can see it coming.
+- Each blocking check is also independently reachable
+  (`POST /v1/validations/name-policy`, `/v1/validations/owner`,
+  `/v1/validations/parent-ou`) for callers that only need one. `orders:validate`
+  and the order pipeline's step 1 are **the same implementation** — "it
+  validated" and "it orders" can't drift apart.
 - The `duplicate` check here is **advisory**: it reflects our order store at
   read time. The authoritative check is the one the create path performs
-  under the DB's unique constraint (§5) — a prevalidation "not a duplicate"
-  can still lose a race to a concurrent submission, which is why the create
-  response (not just validate) is what a caller must trust.
+  under the DB's unique constraint (§5) — a dry run showing "not a duplicate"
+  can still lose a race to a concurrent submission, which is why the actual
+  order response (not just validate) is what a caller must trust for the
+  final outcome.
 - Bulk dry-run: `POST /v1/order-jobs?mode=validate_only` (see 3.3) — same
   ingestion shape, no orders are created, results carry per-line `checks`.
 
@@ -207,15 +223,29 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
 { "order_number": "ord_77190", "status": "skipped", "group_name": "GRP-Finance-ReadOnly",
   "reason": "already_ordered" }
 
-422 Unprocessable Entity  // same error envelope as validate — reuses §3.2's checks
-{ "order_number": "ord_88214", "status": "failed",
-  "error": { "code": "invalid_parent_ou", "message": "OU does not exist or is not writable.",
-             "request_id": "req_...", "retryable": false } }
+422 Unprocessable Entity   // step 1 of the pipeline (§4) — no AD call was made
+{ "order_number": "ord_88214", "status": "validation_failed", "group_name": "GRP-Ops-!!invalid",
+  "reason": [
+    { "field": "group_name", "code": "invalid_group_name",
+      "message": "Group name may not contain '!' and must start with 'GRP-'." },
+    { "field": "parent_ou", "code": "invalid_parent_ou",
+      "message": "OU does not exist or is not writable by this caller." }
+  ] }
+
+502 Bad Gateway   // input was valid, the group wasn't a duplicate — the downstream AD call itself failed
+{ "order_number": "ord_88215", "status": "failed", "group_name": "GRP-Finance-ReadOnly",
+  "error": { "code": "ad_provisioning_timeout", "message": "Directory service did not respond in time.",
+             "request_id": "req_...", "retryable": true } }
 ```
 
-Every response — success, skip, or failure — carries an `order_number`: a
-failed attempt is still a recorded, lookup-able order (req. 5). `orders`
-accepts a top-level array for a small batch:
+Every response — succeeded, validation_failed, skipped, or failed — carries
+an `order_number`: even a rejected attempt is a recorded, lookup-able order
+(req. 5). `validation_failed` (client's input, fixable, no downstream call
+made, not retryable as-is) and `failed` (our/AD's execution error, often
+retryable) are kept as **distinct statuses** on purpose — a caller scripting
+against this API can tell "fix your request" apart from "safe to retry"
+without parsing the error code. `orders` accepts a top-level array for a
+small batch:
 `POST /v1/orders { "orders": [ {...}, {...}, {...} ] }` → `207 Multi-Status`
 with one result per input order, same shape as above, in input order. Capped
 at 25 so the call stays synchronous and bounded; above that, use the bulk job
@@ -258,14 +288,17 @@ Idempotency-Key: b7e1-...            # scopes the whole job — resubmit-safe
 GET /v1/order-jobs/{job_id}
 200 OK
 { "job_id": "job_5f11", "status": "processing",  // queued|processing|completed|completed_with_errors|failed|canceled
-  "total_lines": 4500, "succeeded": 3020, "skipped": 100, "failed": 40, "pending": 1340 }
+  "total_lines": 4500, "succeeded": 3020, "skipped": 100, "validation_failed": 15, "failed": 25, "pending": 1340 }
 
 GET /v1/order-jobs/{job_id}/results?limit=200&cursor=eyJ...
 200 OK
 { "data": [
     { "line": 1, "group_name": "GRP-Finance-ReadOnly", "status": "succeeded", "order_number": "ord_88213" },
     { "line": 2, "group_name": "GRP-Sales-All",         "status": "skipped",  "order_number": "ord_77190", "reason": "already_ordered" },
-    { "line": 3, "group_name": "GRP-Ops-!!invalid",     "status": "failed",   "error": { "code": "invalid_group_name", "...": "..." } }
+    { "line": 3, "group_name": "GRP-Ops-!!invalid",     "status": "validation_failed", "order_number": "ord_88220",
+      "reason": [ { "field": "group_name", "code": "invalid_group_name", "message": "..." } ] },
+    { "line": 4, "group_name": "GRP-HR-All",            "status": "failed", "order_number": "ord_88221",
+      "error": { "code": "ad_provisioning_timeout", "retryable": true, "...": "..." } }
   ],
   "next_cursor": "eyJ...", "has_more": true }
 
@@ -297,7 +330,7 @@ orders bulk submit --file groups.ndjson [--force] [--idempotency-key <key>]
    # prints job_id; add --wait to block and poll to a terminal state
 
 orders bulk status <job_id> [--watch]              # polls until terminal when --watch
-orders bulk results <job_id> [--status failed|skipped|succeeded] [--format table|ndjson] [--out results.ndjson]
+orders bulk results <job_id> [--status validation_failed|failed|skipped|succeeded] [--format table|ndjson] [--out results.ndjson]
 orders bulk cancel <job_id>
 
 orders get <order_number>
@@ -305,11 +338,13 @@ orders get --group-name GRP-Finance-ReadOnly       # reverse lookup (req. 5)
 ```
 
 Exit codes (so bulk submission is scriptable in CI): `0` all lines succeeded
-or were legitimately skipped, `2` completed with some line **failures**
-(`--allow-partial-failure` to keep this from failing the caller's own
-script), `1` job-level failure or a validation error on a single/small-batch
-call, `130` interrupted locally (the job itself keeps running server-side —
-`--watch` can be resumed against the same `job_id`).
+or were legitimately skipped, `2` completed with some lines
+`validation_failed` and/or `failed` (`--allow-partial-failure` to keep this
+from failing the caller's own script; `orders bulk results --status
+validation_failed` vs `--status failed` tells the caller which kind), `1`
+job-level failure, or a single/small-batch call that came back
+`validation_failed`/`failed`, `130` interrupted locally (the job itself keeps
+running server-side — `--watch` can be resumed against the same `job_id`).
 
 ## 4. High-level design
 
@@ -330,10 +365,16 @@ call, `130` interrupted locally (the job itself keeps running server-side —
                             │                      ▼
                             │            ┌──────────────────┐
                             └───────────▶│ Order pipeline    │  (shared code path §3.2/3.3)
-                                         │  1. name-policy check
-                                         │  2. duplicate check (unique constraint is authoritative)
+                                         │  1. validate (name-policy, owner,
+                                         │     parent_ou) → validation_failed
+                                         │     if any check fails, no AD call
+                                         │  2. duplicate check (unique         
+                                         │     constraint is authoritative)    
+                                         │     → skipped if already ordered   
                                          │  3. AD group-create [+ add members]
-                                         │  4. persist order (succeeded/failed/skipped)
+                                         │     → failed on downstream error   
+                                         │  4. persist order (succeeded/       
+                                         │     validation_failed/failed/skipped)
                                          └────────┬──────────┘
                                                   ▼
                                      ┌────────────────────────┐
@@ -353,9 +394,14 @@ call, `130` interrupted locally (the job itself keeps running server-side —
 - **Order pipeline** is the single implementation both the sync endpoint and
   the bulk workers call per line — this is what makes §3.2's "one code path"
   claim true, and what makes partial-failure isolation (§1) fall out for
-  free: each line runs the pipeline independently and reports its own result.
-  Step 2 (duplicate check) always re-verifies against the unique constraint
-  at persist time, never trusting an earlier prevalidation result (§3.2).
+  free: each line runs the pipeline independently and reports its own
+  result. Validation (step 1) always runs as part of placing the order, not
+  as a prerequisite the caller must remember — a caller who *did* call
+  `orders:validate` first gets no special treatment; the order call
+  re-validates anyway, so "it validated" can never go stale by the time the
+  order is actually placed. Step 2 (duplicate check) likewise always
+  re-verifies against the unique constraint at persist time, never trusting
+  an earlier dry-run result (§3.2).
 - **Line-item queue** has (at least) two lanes/priorities — sync-path calls
   don't sit behind a 4,500-line job (§2's fairness requirement) — a
   `task-scheduling` priority-queue concern, not a new component.
@@ -365,7 +411,10 @@ call, `130` interrupted locally (the job itself keeps running server-side —
 ## 5. Data model
 
 - **`orders`** — PK `order_number`. Columns: group_name, group_type, owner,
-  parent_ou, status (`succeeded`|`failed`|`skipped`), error (nullable),
+  parent_ou, status (`succeeded`|`validation_failed`|`failed`|`skipped`),
+  `validation_errors` (nullable array — field/code/message, populated only
+  when status is `validation_failed`), `error` (nullable object —
+  code/message/retryable, populated only when status is `failed`),
   skipped_order_number (nullable — set when status is `skipped`, pointing at
   the order it deferred to), `job_id` (nullable — set when ordered via a bulk
   job), created_at.
@@ -386,16 +435,19 @@ call, `130` interrupted locally (the job itself keeps running server-side —
     that's already ordered," and they can both fire independently).
 - **`order_jobs`** — PK `job_id`. Unique index on `(tenant_id, idempotency_key)`
   so a resubmitted job body returns the same job. Columns: status, total_lines,
-  succeeded/skipped/failed/pending counters (updated by workers, not
-  recomputed by scanning), source (`inline`|`upload_id`), created_at,
-  completed_at.
+  succeeded/skipped/validation_failed/failed/pending counters (updated by
+  workers, not recomputed by scanning), source (`inline`|`upload_id`),
+  created_at, completed_at.
 - **`order_job_items`** — PK `(job_id, line_index)`. Unique index on
   `(job_id, group_name)` — this is the row that makes a resumed/retried job
   idempotent per line: on reprocessing, a line whose `group_name` already has
-  a `succeeded` (or `skipped`) row is returned as-is, not re-run. Columns:
-  status, order_number (nullable), error (nullable), attempt_count.
-  `GET .../results` pages on `(job_id, line_index)` — a stable, monotonic
-  cursor key.
+  a `succeeded` (or `skipped`) row is returned as-is, not re-run — but one
+  that's `validation_failed` *is* re-run on reprocessing (the input didn't
+  change, but re-validating is cheap and correct, unlike re-calling AD).
+  Columns: status (`succeeded`|`validation_failed`|`failed`|`skipped`),
+  order_number (nullable), validation_errors (nullable), error (nullable),
+  attempt_count. `GET .../results` pages on `(job_id, line_index)` — a
+  stable, monotonic cursor key.
 - **`idempotency_keys`** (sync path) — `(tenant_id, idempotency_key)` →
   stored response, TTL 24h, per the standard `api-design` idempotency
   state-machine (pending/complete, reject on same-key-different-body).
@@ -413,6 +465,8 @@ OLTP write volume); if it becomes one, `job_id` is the natural shard key for
 
 | Decision | Solves | Worsens | Change it when |
 |---|---|---|---|
+| Validation is step 1 of the order pipeline (runs on every order call), not a required separate step | Callers can't forget to validate; a `validation_failed` reason is always in the order response itself, no extra round trip needed | The order call always pays validation cost, even for a line dry-run-checked moments earlier — no way to present a "trust me, already validated" token | Blocking checks become expensive enough that skipping a repeat check is worth the complexity → add an optional skip token then |
+| `validation_failed` and `failed` as distinct order statuses | A caller can branch on "fix the request" vs "safe to retry" without parsing error codes (req. 1/5) | One more status value in every enum/consumer (job counts, CLI filters, data model) | Never — this is exactly the distinction the requirement asks for |
 | Sync endpoint (≤25) + separate async job endpoint (up to 4,500+) | Keeps single-order latency low; lets bulk scale independently | Two code paths to keep behaviorally identical (mitigated: both call the same order pipeline, §4) | The sync cutover (25) is wrong for real traffic → tune, don't redesign |
 | `group_name` as the dedupe/business key (no separate `external_id`) | One fewer field to require from callers; "look up by group name" and "already ordered" share one index (§5) | Renaming a group later has no clean story here (out of scope, §1) — the key is fixed at order time | Group names can legitimately repeat across domains → key becomes `(domain, group_name)` (already the plan, §5) |
 | Skip-by-default on duplicate, `force=true` to override | Prevents accidental re-ordering of an existing/in-flight group; caller still gets the original order number back (req. 5/6) | A caller who *meant* to retry a `failed` order must know failed orders aren't skipped by default (§5) — needs to be documented, not surprising | Business wants "already ordered" to include failed attempts too → widen the partial-unique-index predicate |
@@ -425,6 +479,12 @@ OLTP write volume); if it becomes one, `job_id` is the natural shard key for
 
 ## 7. Failure modes & degradation
 
+- **Invalid input** (bad group-name format, unknown/unpermitted owner, a
+  parent OU that doesn't exist or isn't writable) — caught at step 1 of the
+  pipeline, before any downstream call is made. Returns `validation_failed`
+  with the specific field/code/message immediately (fast, cheap, and doesn't
+  consume any of the AD provisioning quota from §2) — this is the case the
+  "validation happens as part of the order" requirement targets directly.
 - **AD provisioning API slow or down** — each call is wrapped in a timeout +
   circuit breaker (`resilience-failure`). Sync path: the order fails fast
   with a `retryable: true` 5xx rather than hanging. Bulk path: the breaker
@@ -451,19 +511,25 @@ OLTP write volume); if it becomes one, `job_id` is the natural shard key for
   before the crash (but before ack) is detected as already-succeeded on
   redelivery, not double-created.
 - **One malformed name / policy violation / already-ordered line in 4,500**
-  — fails or skips independently (`order_job_items.status = failed|skipped`
-  with detail), the other 4,499 proceed; the job's final status is
-  `completed_with_errors` only when there's a real `failed` line — an
-  all-`skipped` outcome is still `completed`, since nothing went wrong.
+  — resolves independently (`order_job_items.status = validation_failed|
+  failed|skipped` with detail), the other 4,499 proceed; the job's final
+  status is `completed_with_errors` when there's a real `failed` line (a
+  downstream/execution problem worth flagging) — an all-`skipped` or
+  all-`validation_failed` outcome is still `completed`, since the pipeline
+  did exactly what it should with cleanly-rejected input, nothing "went
+  wrong" operationally.
 - **Upload interrupted (large NDJSON)** — the client/CLI retries the PUT and
   resubmits `POST /v1/order-jobs` with the same job `Idempotency-Key`;
   nothing has been processed yet, so this is a clean retry.
 - **What the user sees:** a sync call either succeeds, is cleanly skipped
-  with the original order number, or comes back with a precise error, in
-  ≤1.5s; a bulk job always finishes in a *terminal* state visible via
+  with the original order number, comes back `validation_failed` with the
+  exact reason (their input, fixable, no AD call attempted), or comes back
+  `failed` with a retryable/non-retryable downstream error — always in
+  ≤1.5s. A bulk job always finishes in a *terminal* state visible via
   `GET /v1/order-jobs/{id}` (never "stuck"), with per-line detail for exactly
-  the lines that failed or were skipped — never an all-or-nothing rollback of
-  4,500 orders because of one bad group name.
+  the lines that were skipped, failed validation, or failed downstream —
+  never an all-or-nothing rollback of 4,500 orders because of one bad group
+  name.
 
 ## 8. Scale evolution
 
