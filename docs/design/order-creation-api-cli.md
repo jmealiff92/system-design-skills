@@ -47,7 +47,12 @@ caller explicitly forces a re-order.
 6. **Skip duplicate orders.** If a group has already been ordered
    (successfully, or is currently in flight), a new order for the same group
    name is **skipped**, not re-attempted — *unless* the caller passes
-   `force=true`, in which case a new order is created regardless.
+   `force=true`, in which case a new order is created regardless. A
+   **`failed`** order is not "already ordered" — a new order for that group
+   name proceeds normally, no `force` needed, and may carry different
+   parameters than the failed attempt (e.g. a different `secondary_owner`
+   after a `not_active_fte` rejection) — confirmed intended, not just a side
+   effect of the dedupe rule (§9).
 7. **CLI** wraps all of the above: validate, order (single/small-batch),
    submit a bulk file, poll/watch a bulk job, fetch results, get one order by
    number or by group name.
@@ -118,8 +123,18 @@ caller explicitly forces a re-order.
   than storage or compute.
 - Average order line (`group_name`, `primary_owner`, `secondary_owner`) is
   ~150 bytes as JSON.
-- `secondary_owner` must be a different AD principal than `primary_owner` —
-  a governance assumption, not stated by the requirement; flagged in §9.
+- **`primary_owner` and `secondary_owner` must be different AD principals**
+  — confirmed requirement, enforced as a blocking validation check (§3.2).
+- **A `failed` order does not block a retry, and the retry may carry
+  different parameters than the failed attempt** — confirmed: e.g. a caller
+  who got `not_active_fte` on `secondary_owner` can resubmit the same
+  `group_name` with a different `secondary_owner`, with no `force` needed
+  (§5's unique index already excludes `failed`, so this was already how the
+  data model worked — this confirms it's intended behavior, not a side
+  effect). One consequence worth being explicit about: such a retry must use
+  a **new** `Idempotency-Key`, not the failed attempt's — reusing the same
+  key with a different body is a `422` key-reuse conflict by the standard
+  idempotency contract (`api-design`), since the body has genuinely changed.
 - The owner id format (what the regex checks) is a corporate identifier —
   email or employee id — exact pattern owned by policy, not specified here
   (§9).
@@ -512,20 +527,79 @@ running server-side — `--watch` can be resumed against the same `job_id`).
 - **Cache** sits in front of the LDAP existence-check and FTE-check APIs
   (§2/§5/§6) — a `caching` building block, cache-aside, TTL-evicted (neither
   upstream system pushes invalidation events). It's what turns ~9,000
-  potential calls per 4,500-order bulk job into a few hundred (§2). Can share
-  infrastructure with the rate limiter operationally, but the two are
-  logically separate: one throttles a scarce write budget, the other avoids
-  redundant reads.
+  potential calls per 4,500-order bulk job into a few hundred (§2).
+  Logically separate from the rate limiter (one throttles a scarce write
+  budget, the other avoids redundant reads) — whether it's a *separate
+  physical* component (Redis) or a table in the same Postgres instance is a
+  deployment-topology choice, not a design one; see below.
 - **Shared rate limiter** is the component §2's numbers actually demand: one
   token bucket, refilled at 100/min, that every downstream AD call (sync or
   bulk) acquires a token from before dispatch — not per-worker limiting,
   which would either over- or under-count the real budget. A small slice of
   the bucket is reserved for the sync lane (§6) so a big bulk job can't starve
-  single-order latency.
+  single-order latency. Physically, this can live in Postgres too at this
+  volume — see Deployment topology below.
 - **Blob store** exists only for the upload path (>500 lines) — a
   `blob-store` building block, not a bespoke file service.
 - **Order store** is a single relational database (PostgreSQL or equivalent)
   — see §5 for why SQL, and why one instance is enough at this volume.
+
+### Deployment topology
+
+**"An API pod and a Postgres (or other DB) StatefulSet pod" is the right
+shape for this design's confirmed scale** — everything in §2 (≤100 writes/
+minute by construction, a handful of stateful components, no sharding
+story, §8) argues for as few moving pieces as possible, not a sprawling
+component-per-box.
+
+- **API pod(s)** — a stateless Deployment, N replicas for HA and to soak up
+  read traffic (lookups, job-status polling) that isn't rate-limited at all
+  (only the AD-create call is, §2). This same image is also where bulk-job
+  dispatch runs: given the confirmed ceiling (~1.67 req/s), it doesn't need
+  a separate worker deployment — one of the replicas (or all of them,
+  coordinating via the DB) polling `order_job_items` for pending rows using
+  `SELECT ... FOR UPDATE SKIP LOCKED` is enough of a "queue" at this volume
+  (`task-scheduling`'s pull-worker pattern, with Postgres as the transport
+  instead of a broker).
+- **Postgres StatefulSet** — yes, and it can plausibly host **more than just
+  the order tables**, given how small every number in this design turned
+  out to be (§2):
+  - The **rate limiter** (§4/§6) can be a single row updated atomically
+    (`UPDATE ... SET tokens = tokens - 1 WHERE tokens > 0`, refilled by a
+    scheduled job or lazily on read) instead of standing up Redis — at
+    ~1.67 req/s this is well within what row-level locking on one row
+    handles without contention.
+  - The **cache** (§5, LDAP-existence and FTE results) can be a table with
+    an `expires_at` column instead of a separate cache cluster — reads
+    filter on `expires_at > now()`; a periodic job (or lazy delete-on-read)
+    reclaims expired rows. Cache hit-rate at this scale doesn't need
+    sub-millisecond Redis latency to be worth having.
+  - Even a bulk-job **upload** (§3.3) — up to ~4,500 lines at ~150B each is
+    well under 1MB — fits as a `bytea`/large-object column instead of
+    needing real object storage, if simplicity is worth more than following
+    the `blob-store` pattern literally at this size.
+
+  Folding all of that into Postgres turns the topology into genuinely just
+  the two pods asked about — no Redis, no message broker, no S3-compatible
+  store — **at this confirmed volume.** The trade-off is coupling: a
+  Postgres outage now takes down order storage, rate limiting, caching, and
+  job dispatch together, not just writes. For a system whose own numbers
+  say "small, internal, low-stakes" (§1/§2), that coupling is a reasonable
+  price for the operational simplicity of one stateful component instead of
+  four. It stops being reasonable if any of §8's growth triggers land (a
+  real batch-create API changes the shape of things regardless; a much
+  higher rate limit or much higher read volume would start to make a
+  separate cache/rate-limiter worth splitting out again).
+- **HA for the StatefulSet itself** is the one gap a single pod leaves
+  open — not addressed by "just run it as a StatefulSet." Two reasonable,
+  equally valid paths: run it as a **managed Postgres service** (RDS/Cloud
+  SQL/equivalent) instead of self-hosting, which removes the
+  backup/failover/patching burden entirely and is usually the better
+  default when one's available; or, if it must stay in-cluster, a
+  StatefulSet **with replicas** behind a Postgres HA operator (e.g.
+  CloudNativePG, Zalando) rather than a single pod, since a single-replica
+  StatefulSet is still a SPOF for everything listed above regardless of how
+  little it's doing.
 
 ## 5. Data model
 
@@ -585,17 +659,20 @@ sharding story needed, ever, at this design's scale (see §8).
   stored response, TTL 24h, per the standard `api-design` idempotency
   state-machine (pending/complete, reject on same-key-different-body).
 
-**Cache (separate from the relational store above — e.g. Redis, not a DB
-table):** two namespaces, both cache-aside with a TTL (neither upstream
+**Cache** — logically distinct from the tables above regardless of where it
+physically lives (a separate Redis, or a table in this same Postgres
+instance — a deployment-topology choice, not a design one; see §4's
+Deployment topology). Two namespaces, both cache-aside with a TTL (neither
+upstream
 system offers invalidation events, so TTL expiry is the only eviction
 mechanism):
-- `fte:{owner_id} → active|inactive`, **TTL ~15 minutes.** Long enough that
-  a 4,500-line job's owner reuse (§2) collapses to ~50–200 calls; short
-  enough to bound the real risk here — a cached `active` for someone
-  terminated moments ago would let a stale cache approve an owner the live
-  API would reject. This is a **genuine staleness risk**, not a
-  self-correcting one (AD itself doesn't care who the owner is), which is
-  why the TTL is the main lever and is called out again in §9.
+- `fte:{owner_id} → active|inactive`, **TTL 15 minutes (confirmed).** Long
+  enough that a 4,500-line job's owner reuse (§2) collapses to ~50–200
+  calls; the staleness this trades for — a cached `active` for someone
+  terminated moments ago approving an owner the live API would now reject —
+  is a **genuine risk, not a self-correcting one** (AD itself doesn't care
+  who the owner is), but the 15-minute window has been confirmed acceptable
+  for this system.
 - `ldap_exists:{group_name} → found|not_found`, **TTL ~60 seconds.** Short —
   its only real job is avoiding a duplicate LDAP round trip between a
   validate-then-order pair for the same line (§3.2), not surviving across a
@@ -630,7 +707,7 @@ every access pattern here is job-scoped.
 | A single shared rate limiter (one 100/min token bucket), not per-worker limiting | Correctly enforces the real, confirmed constraint (§2) regardless of worker-pool size — adding workers can't accidentally over-spend the budget | Every call path (sync and bulk) now depends on one shared piece of state — it must be fast and available, or nothing can place an order (→ §7) | Never, while the limit is a single system-wide number; if AD ever exposes per-tenant quotas, the bucket becomes per-tenant |
 | A reserved slice of the 100/min budget for the sync lane (not just dispatch-order priority) | A big bulk job literally cannot starve single-order latency down to zero, even under the confirmed low ceiling (§2) | Reserved sync capacity is bulk capacity not spent — a max bulk job takes a little longer than the raw 45 min math (§2) | The real traffic mix shows sync calls are rare enough that a reservation wastes bulk throughput → shrink or drop it |
 | PostgreSQL (single relational instance) for the order store, not NoSQL | Atomic unique constraints are what make the group-name and idempotency-key dedupe (§5) correct under concurrency; the confirmed 100/min limit keeps volume trivial for one instance | A single writer to keep available (standard HA replica, not a novel problem here) | Never, at this design's scale (§8) — revisit only if `data-storage` scale numbers actually demand a distributed store |
-| Skip-by-default on duplicate, `force=true` to override | Prevents accidental re-ordering of an existing/in-flight group; caller still gets the original order number back (req. 5/6) | A caller who *meant* to retry a `failed` order must know failed orders aren't skipped by default (§5) — needs to be documented, not surprising | Business wants "already ordered" to include failed attempts too → widen the partial-unique-index predicate |
+| Skip-by-default on duplicate, `force=true` to override; a `failed` order never blocks a retry (confirmed — §1) | Prevents accidental re-ordering of an existing/in-flight group; a failed attempt can be freely resubmitted, including with different owners, with no `force` needed (req. 5/6) | A retry after `failed` must use a new `Idempotency-Key` (§1) — reusing the old one with different owners is a key-reuse conflict, not a silent success | Never, as confirmed — only if "already ordered" is later redefined to include failed attempts would the unique-index predicate need to widen |
 | Duplicate check enforced by a **DB unique constraint**, not just the app-level `orders:validate` pre-check | Correct under concurrency — two racing submissions for the same group can't both succeed | The loser of the race gets its `skipped` result at insert time, not at validate time — slightly less "predictable" from the client's view | Never — this is the correctness backstop; relaxing it reopens the duplicate-group race |
 | `force=true` still goes through the real AD create call (not a bypass of AD's own uniqueness) | A forced re-order of a group AD still has fails cleanly with a clear error, never silently duplicates | `force` looks like it "always creates" but sometimes still fails — needs documenting | Never — bypassing AD's own check would let this API create actual duplicate directory objects |
 | Inline body (≤500 lines) *or* presigned-upload for bulk | Never hits a gateway payload ceiling as batch size grows | Two ingestion paths in the client/CLI to implement | Gateway payload limits change → could raise the inline threshold instead |
@@ -759,11 +836,6 @@ constraint (§2/§6):
 
 ## 9. Open questions
 
-- **Does "already ordered" include failed attempts?** This design's default
-  (§5/§6) is: skip only on `succeeded`/`pending`/`processing`, allow retry on
-  `failed` without needing `force`. Confirm this matches intent — if a
-  failed order should also require `force` to retry, the unique-index
-  predicate in §5 changes from excluding `failed` to including everything.
 - **Should an `exists_in_ad` skip backfill an order record?** (§1's now-
   narrower out-of-scope item) The LDAP check catches a group created outside
   this process at validation time, and it's cleanly `skipped` (§3.2/§3.3) —
@@ -775,21 +847,16 @@ constraint (§2/§6):
   SLAs?** Unstated (§1/§2) — the caching design (§5/§6) is this system's own
   mitigation regardless of the answer, but the cache TTLs and whether a
   circuit breaker is even needed depend on it.
-- **Is 15 minutes the right FTE-cache TTL?** (§5) It trades "fewer calls" for
-  "a just-terminated employee could still be accepted as an owner for up to
-  that long." This is a business/compliance call, not a technical one —
-  confirm the acceptable staleness window.
 - **Is the 100/min limit truly one global ceiling**, or actually per
   app-registration/service-principal in a way that would let a second
   registration double the effective budget? This design assumes one shared
   system-wide bucket (§2/§5/§6) as the safe/conservative reading — worth
   confirming, since a per-registration limit would change the rate-limiter
   design (multiple buckets, one per registration) and the §8 scale story.
-- **`secondary_owner != primary_owner`** — assumed as a governance rule
-  (§1), not stated in the requirement. Confirm whether it should actually be
-  enforced, and whether AD's own `owners` semantics distinguish "primary"
-  from "secondary" at all, or whether that distinction is purely this
-  system's metadata (§3.1).
+- **Does AD's own `owners` semantics distinguish "primary" from
+  "secondary"?**, or is that distinction purely this system's metadata
+  (§3.1) — `primary_owner != secondary_owner` itself is now confirmed
+  (§1/§3.2), this is only about how the two map onto AD's owner model.
 - **Exact owner-id regex** — assumed to be an email/employee-id shape (§1);
   the real pattern (and whether `primary_owner`/`secondary_owner` must be
   the same *kind* of identifier) needs the actual policy.
@@ -815,7 +882,7 @@ capacity** (§1/§2/§9). Every number in §2 for them (9,000 uncached calls,
 ~50–200 cached) is this design's own estimate of the load it will offer, not
 a confirmed budget those systems can absorb; the caching strategy (§5/§6) is
 built to reduce that load regardless, but whether it reduces it *enough*
-can't be confirmed until those APIs' real limits are known. §9's other
-open questions (already-ordered-on-failed-attempts, the FTE-cache TTL,
-whether the 100/min limit is truly global) are the design's next-most
+can't be confirmed until those APIs' real limits are known. §9's other open
+questions (whether the 100/min limit is truly global, the `exists_in_ad`
+backfill decision, the exact owner-id regex) are the design's next-most
 load-bearing choices, but all are second to this one.
