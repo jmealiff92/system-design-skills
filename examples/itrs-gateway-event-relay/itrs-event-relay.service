@@ -1,0 +1,31 @@
+[Unit]
+Description=ITRS Geneos -> EMS event relay (pooled HTTP delivery for itrs_notify.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/itrs-event-relay/event_relay.py
+Restart=always
+RestartSec=2
+
+# Config: see README.md for the full list. At minimum:
+Environment=ITRS_EMS_URL=https://ems.internal/api/v1/events
+EnvironmentFile=-/etc/itrs-event-relay/env    # put ITRS_EMS_TOKEN etc. here, mode 0600
+
+# The daemon writes only its socket + spool/DLQ directories.
+RuntimeDirectory=itrs-event-relay
+StateDirectory=itrs-event-relay
+User=itrs-relay
+Group=itrs-relay
+
+# Give shutdown time to drain the in-memory queue to disk (see event_relay.py Relay.run()).
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/run/itrs-event-relay /var/spool/itrs-event-relay
+
+[Install]
+WantedBy=multi-user.target
