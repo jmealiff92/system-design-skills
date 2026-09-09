@@ -1,0 +1,45 @@
+# {{ ansible_managed | default('Managed by Ansible - local changes will be overwritten') }}
+[Unit]
+Description=ITRS Geneos -> EMS event relay (pooled HTTP delivery for itrs-notify)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{ itrs_relay_install_dir }}/event-relay
+Restart=always
+RestartSec=2
+
+Environment=ITRS_RELAY_WORKERS={{ itrs_relay_workers }}
+Environment=ITRS_RELAY_QUEUE_MAXSIZE={{ itrs_relay_queue_maxsize }}
+Environment=ITRS_RELAY_ATTEMPT_TIMEOUT_S={{ itrs_relay_attempt_timeout_s }}
+Environment=ITRS_RELAY_MAX_RETRIES={{ itrs_relay_max_retries }}
+Environment=ITRS_RELAY_BREAKER_THRESHOLD={{ itrs_relay_breaker_threshold }}
+Environment=ITRS_RELAY_BREAKER_OPEN_S={{ itrs_relay_breaker_open_s }}
+Environment=ITRS_RELAY_HTTP2={{ itrs_relay_http2 }}
+Environment=ITRS_RELAY_SPOOL={{ itrs_relay_spool_dir }}/pending.jsonl
+Environment=ITRS_RELAY_DLQ={{ itrs_relay_spool_dir }}/dead_letter.jsonl
+# ITRS_EMS_URL / ITRS_EMS_TOKEN live here, mode 0600, not in this unit file:
+EnvironmentFile=/etc/itrs-event-relay/env
+
+# Root pre-creates /run/{{ itrs_relay_runtime_dir_name }} owned by
+# {{ itrs_relay_user }} before dropping privileges — this is what lets a
+# non-root daemon user bind a socket under /run at all (see the design
+# doc's Ansible-role notes). The spool dir is NOT managed this way (it
+# needs cross-user write access the daemon's own UID can't grant on its
+# own) — the role's tasks/main.yml creates it explicitly instead.
+RuntimeDirectory={{ itrs_relay_runtime_dir_name }}
+User={{ itrs_relay_user }}
+Group={{ itrs_relay_group }}
+
+# Give shutdown time to drain the in-memory queue to disk (see main.go's
+# shutdown sequence).
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths={{ itrs_relay_spool_dir }}
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# Real inventory (hostnames) and any vault password file — copy
+# inventory.example.ini to inventory.ini and fill it in locally, don't
+# commit it.
+inventory.ini
+*.vault_pass
+dist/

@@ -1,0 +1,9 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart itrs-event-relay
+  ansible.builtin.systemd:
+    name: itrs-event-relay
+    state: restarted

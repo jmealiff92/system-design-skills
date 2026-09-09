@@ -1,0 +1,111 @@
+---
+- name: Create the itrs-relay group
+  ansible.builtin.group:
+    name: "{{ itrs_relay_group }}"
+    system: true
+    state: present
+
+- name: Create the itrs-relay system user
+  ansible.builtin.user:
+    name: "{{ itrs_relay_user }}"
+    group: "{{ itrs_relay_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    state: present
+
+# The daemon and Geneos's own trigger-running user are different accounts,
+# but both need write access to the shared spool: the daemon (crash
+# recovery, breaker-open re-spool, rotate/rename during drain) and
+# itrs-notify (its disk fallback when the daemon is unreachable/busy).
+# Sharing a group + setgid directory (below) is the standard way to do
+# that without loosening the directory to world-writable.
+- name: Add the Geneos runtime user to the shared spool group
+  ansible.builtin.user:
+    name: "{{ itrs_geneos_user }}"
+    groups: "{{ itrs_relay_group }}"
+    append: true
+  when: itrs_geneos_user is defined and itrs_geneos_user | length > 0
+
+- name: Create install directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ itrs_relay_install_dir }}"
+    - "{{ itrs_notify_install_dir }}"
+    - /etc/itrs-event-relay
+
+# setgid (the leading 2 in "2775") makes every file/dir created inside
+# inherit this directory's group regardless of which user created it, so
+# the daemon can always rename/delete files itrs-notify's fallback path
+# wrote (and vice versa is never needed, but symmetry costs nothing here).
+- name: Create the shared spool directory
+  ansible.builtin.file:
+    path: "{{ itrs_relay_spool_dir }}"
+    state: directory
+    owner: root
+    group: "{{ itrs_relay_group }}"
+    mode: "2775"
+
+- name: Map this host's architecture to a GOARCH suffix
+  ansible.builtin.set_fact:
+    itrs_goarch: "{{ itrs_goarch_map[ansible_architecture] | default(omit) }}"
+
+- name: Fail loudly on an unmapped architecture rather than silently deploying the wrong binary
+  ansible.builtin.fail:
+    msg: >-
+      No itrs_goarch_map entry for ansible_architecture={{ ansible_architecture }}
+      on {{ inventory_hostname }}. Add it (and build that GOARCH's binaries)
+      before including this host in the rollout.
+  when: itrs_goarch is not defined
+
+- name: Deploy the event-relay binary
+  ansible.builtin.copy:
+    src: "{{ itrs_relay_binaries_dir }}/event-relay-linux-{{ itrs_goarch }}"
+    dest: "{{ itrs_relay_install_dir }}/event-relay"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart itrs-event-relay
+
+- name: Deploy the itrs-notify binary
+  ansible.builtin.copy:
+    src: "{{ itrs_relay_binaries_dir }}/itrs-notify-linux-{{ itrs_goarch }}"
+    dest: "{{ itrs_notify_install_dir }}/itrs-notify"
+    owner: root
+    group: root
+    mode: "0755"
+    # No handler/restart: itrs-notify is forked fresh by Geneos on every
+    # trigger, so the very next trigger after this copy already runs the
+    # new binary. There's no long-running process here to bounce.
+
+- name: Write the EMS token / secrets env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/itrs-event-relay/env
+    owner: "{{ itrs_relay_user }}"
+    group: "{{ itrs_relay_group }}"
+    mode: "0600"
+  notify: restart itrs-event-relay
+
+- name: Install the systemd unit
+  ansible.builtin.template:
+    src: itrs-event-relay.service.j2
+    dest: /etc/systemd/system/itrs-event-relay.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart itrs-event-relay
+
+- name: Enable and start the relay daemon
+  ansible.builtin.systemd:
+    name: itrs-event-relay
+    enabled: true
+    state: started
+    daemon_reload: true

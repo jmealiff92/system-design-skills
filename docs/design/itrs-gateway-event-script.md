@@ -56,6 +56,21 @@ the same clock:
 
 Conflating them is what breaks this design under load — see §4.
 
+> **Empirically validated, not just estimated.** The current production
+> approach is a shell script invoked per Effect (`curl` + no timeout/retry),
+> the exact shape this section's estimate warns about. Rather than rest on
+> the math alone, `examples/itrs-gateway-event-relay/benchmark/BENCHMARK.md`
+> load-tests a representative reconstruction of it against this design,
+> head to head, and gets hard numbers: the naive script's own p99 latency
+> alone exceeds the 500ms SLA by 2–10× at peak concurrency (against a
+> *healthy* backend), it leaves one OS-level TCP connection in `TIME_WAIT`
+> per trigger with no ceiling (≈60,000 at sustained peak — more than the
+> host's ephemeral port range), and it hangs its process **indefinitely**
+> against a backend that accepts a connection and just doesn't respond —
+> an outage in the monitoring pipeline itself, not merely a slow one. Read
+> that doc for the reproduction steps if a stakeholder needs to see it
+> proven rather than asserted.
+
 ## 2. Scale estimates (`back-of-the-envelope`)
 
 | Quantity | Value | Assumption |
@@ -356,8 +371,10 @@ fills.
   any host on a different OS/architecture (e.g. `arm64`) just needs its own
   `GOOS`/`GOARCH` build in the same CI pipeline — confirm the fleet's
   architecture mix before assuming one build artifact covers all 80.
-- **Binary distribution mechanism** — this design assumes *something*
-  (config management, an image build, a deploy pipeline) gets a built
-  binary onto all 80 hosts; that mechanism isn't specified here and should
-  be whatever this organization already uses to push files to the Gateway
-  fleet, not a new one invented for this.
+- ~~Binary distribution mechanism~~ **Resolved: Ansible.** See
+  `examples/itrs-gateway-event-relay/ansible/` — a role/playbook that
+  deploys both binaries, the systemd unit, and (the part worth reading
+  even if Ansible itself is old news) a shared, setgid spool directory
+  with the two binaries' different system users both able to write it,
+  rolled out in `serial: "10%"` batches rather than to all ~80 hosts/regions
+  in one play.

@@ -10,7 +10,8 @@ this README is setup/ops instructions, not the design rationale.
 | `cmd/itrs-notify/` | Geneos Gateway Effect (forked per trigger) | reads env vars, hands the event to the relay daemon, exits. |
 | `cmd/event-relay/` | a long-running daemon, one per Gateway host | owns the pooled HTTPS connection, retries, circuit breaker, spool/DLQ. |
 | `internal/spool/`, `internal/uuid/` | shared code, compiled into both binaries | atomic spool/DLQ line format; dependency-free UUIDv4. |
-| `itrs-event-relay.service` | — | example systemd unit for `event-relay`. |
+| `ansible/` | — | the deployment mechanism — an Ansible role/playbook for the ~80-host fleet. See `ansible/README.md`. |
+| `benchmark/` | — | load tests proving *why* this design replaces a naive per-effect shell script, with real measured numbers. See `benchmark/BENCHMARK.md`. |
 
 Both are **single static binaries** (`CGO_ENABLED=0`) with **zero runtime
 dependencies** — nothing to `pip install`/`apt install` on any host, and
@@ -56,35 +57,44 @@ only the implementation does.
 
 ```bash
 # From this directory. Fully static — no libc/interpreter dependency on
-# the target host, and cross-compiles for every region from one machine.
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o itrs-notify ./cmd/itrs-notify
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o event-relay ./cmd/event-relay
+# the target host. Name matches what ansible/roles/itrs_event_relay expects
+# (event-relay-linux-<goarch>, itrs-notify-linux-<goarch>) so the build
+# output can be dropped straight into ansible/dist/ and deployed as-is.
+mkdir -p ansible/dist
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ansible/dist/itrs-notify-linux-amd64 ./cmd/itrs-notify
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ansible/dist/event-relay-linux-amd64 ./cmd/event-relay
 
-# A region running arm64 hosts: swap GOARCH=arm64 and build again — same
-# source, same binary-per-host guarantee, no toolchain needed on the host.
+# A region running arm64 hosts: same source, swap GOARCH=arm64 and build
+# again into the *-linux-arm64 filenames — no toolchain needed on the host,
+# and ansible/roles/itrs_event_relay picks the right one per host via
+# ansible_architecture. See ansible/README.md.
 ```
 
-Build once in CI, distribute the two binaries to all Gateway hosts (config
-via env vars, no other files needed). `go vet ./...` and `gofmt -l .` are
-clean on this tree — wire them into CI alongside the build.
+Build once in CI. `go vet ./...` and `gofmt -l .` are clean on this tree —
+wire them into CI alongside the build, before publishing the artifacts
+Ansible deploys.
 
-## Setup
+## Deploying
 
-1. **Deploy `event-relay`** to each Gateway host (co-located with the
-   Gateway, so the hand-off socket is local) and run it as a service:
-   ```bash
-   cp event-relay /opt/itrs-event-relay/
-   cp itrs-event-relay.service /etc/systemd/system/
-   mkdir -p /etc/itrs-event-relay
-   printf 'ITRS_EMS_TOKEN=...\n' > /etc/itrs-event-relay/env
-   chmod 600 /etc/itrs-event-relay/env
-   useradd --system --no-create-home itrs-relay || true
-   systemctl daemon-reload
-   systemctl enable --now itrs-event-relay
-   ```
-2. **Deploy `itrs-notify`** anywhere Geneos can invoke it — one file, no
-   install step. Point a Gateway Effect at it:
-   - **Command:** `/opt/itrs-notify/itrs-notify`
+**Use `ansible/`** — see `ansible/README.md` for the full walkthrough
+(inventory, vault-managed EMS token, canary-then-wave rollout across the
+~80 hosts). It handles both binaries, the systemd unit, and the shared
+spool directory's cross-user permissions (`itrs-notify` and `event-relay`
+run as different system users — see that README for why a plain
+`chmod 777` isn't the right fix).
+
+For understanding what gets deployed and why (skip if you're only running
+the playbook):
+
+1. **`event-relay`** runs as a systemd service, one per Gateway host,
+   co-located with the Gateway so the hand-off socket is local:
+   `ansible/roles/itrs_event_relay/templates/itrs-event-relay.service.j2`
+   is the canonical unit definition — read it rather than hand-rolling one,
+   since it encodes the cross-user spool-permission fix above.
+2. **`itrs-notify`** is just a file Geneos invokes — no service, no
+   install step beyond the binary being present. Point a Gateway Effect at:
+   - **Command:** `/opt/itrs-notify/itrs-notify` (the Ansible role's default
+     `itrs_notify_install_dir`)
    - **Arguments:** *(none needed)*
    - No extra environment configuration is required *for the hand-off* —
      Geneos already exports the trigger context as env vars, which is all

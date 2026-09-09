@@ -1,0 +1,11 @@
+---
+- name: Deploy the ITRS Gateway -> EMS event relay
+  hosts: itrs_gateway_hosts
+  become: true
+  # ~80 hosts across regions: never bet the whole fleet on one rollout.
+  # 10% is a reasonable default canary-then-wave size for a routine
+  # binary/config update; combine with `--limit` (see README.md) for a
+  # single-host or single-region canary before widening.
+  serial: "10%"
+  roles:
+    - itrs_event_relay
