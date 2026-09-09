@@ -2,7 +2,7 @@
 
 A write-up structured around the reasoning loop (`system-design` skill), composing
 `requirements-scoping` → `back-of-the-envelope` → `api-design` → `data-storage` →
-`task-scheduling` / `messaging-streaming` → `resilience-failure`.
+`caching` → `task-scheduling` / `messaging-streaming` → `resilience-failure`.
 
 **Domain note:** an "order" here is a request to **create one Active Directory
 (AD) group** — not a physical-goods order. There is no inventory, pricing, or
@@ -30,10 +30,13 @@ caller explicitly forces a re-order.
 3. **Order a large batch of groups** (up to **4,500** in scope; designed not
    to fall over above that) without forcing the caller to hold a connection
    open for minutes.
-4. **Validate order parameters inline, on every order** — group-name
-   policy/format and both `primary_owner`/`secondary_owner` being valid,
-   permitted, distinct AD principals are checked as the first step of
-   placing the order (single, small-batch, or each line of a bulk job); a
+4. **Validate order parameters inline, on every order** — as the first step
+   of placing the order (single, small-batch, or each line of a bulk job):
+   group-name policy/format; `primary_owner`/`secondary_owner` id format
+   (regex) and that they're distinct; both owners are **active full-time
+   employees** (an API call); and the group **doesn't already exist in AD**
+   (an LDAP lookup — this is what catches a group created outside this
+   process entirely, not just one this system already has an order for). A
    standalone dry-run call (§3.2) is *available* for a caller who wants to
    check before committing, but is optional, not a prerequisite.
 5. **Look up an order by order number *or* by group name**, and see its
@@ -74,6 +77,11 @@ caller explicitly forces a re-order.
 - **Auditability** — every order's outcome (succeeded / validation_failed /
   failed / skipped, and the exact reason or error) must be queryable after
   the fact by order number *or* group name, not just streamed once.
+- **Bounded load on the validation dependencies.** The LDAP group-existence
+  check and the active-FTE check are each a network call this design would
+  otherwise make once or twice per order — at 4,500 orders/job that's
+  thousands of calls to systems whose own capacity isn't stated. Caching
+  (§3.2/§5) exists specifically to bound this, not just to shave latency.
 
 ### Out of scope (explicitly)
 - The AD/directory provisioning engine itself (the actual LDAP/Graph-API
@@ -83,10 +91,14 @@ caller explicitly forces a re-order.
 - Group **lifecycle after creation** — membership changes, renaming,
   deletion, ownership transfer. This design only covers *ordering the
   creation*.
-- Detecting a group that was created **directly in AD**, outside this system
-  (no order record at all) — the duplicate check in this design is against
-  *our own order history*, not a live AD directory scan. Flagged as an open
-  question in §9.
+- **Reconciling** a group the LDAP existence check (§3.2) finds already in
+  AD with no order record behind it (created outside this process) — this
+  design *detects* that case at validation time (in scope, unlike the
+  earlier draft), but backfilling an order record for it, or any broader
+  drift audit/sync, is not designed here. Flagged in §9.
+- The **LDAP existence-check and active-FTE-check APIs themselves** — their
+  own availability, latency, and rate limits are assumed, not designed
+  (§9); this design only decides how it calls and caches them.
 - Auth/authz model for who may order which groups — assumed to exist (API
   key / SSO), not designed here.
 - Multi-region/multi-tenant data residency — assumed single-region/single-
@@ -108,6 +120,20 @@ caller explicitly forces a re-order.
   ~150 bytes as JSON.
 - `secondary_owner` must be a different AD principal than `primary_owner` —
   a governance assumption, not stated by the requirement; flagged in §9.
+- The owner id format (what the regex checks) is a corporate identifier —
+  email or employee id — exact pattern owned by policy, not specified here
+  (§9).
+- "Active full-time employee" is a binary the FTE-check API returns; this
+  design treats a `false`/not-found response as a blocking validation
+  failure, not a warning.
+- The LDAP existence-check and FTE-check APIs are **separate systems** from
+  the AD provisioning (group-create) API, with their own latency/rate limits
+  — **not** assumed to share the 100/min budget (§2). Worth confirming (§9).
+- **Owner reuse across a bulk job is high** — the same handful of managers/
+  teams order most groups in a given submission, so the distinct-owner count
+  in a 4,500-line job is assumed to be a small fraction of 9,000 (2 owners ×
+  4,500). This is exactly what makes caching the FTE check valuable (§2/§6);
+  flagged as an assumption because the real distribution isn't known.
 
 ## 2. Scale estimates
 
@@ -125,6 +151,14 @@ caller explicitly forces a re-order.
 | Time for a 4,500-order bulk job | **~45 minutes** | 4,500 ÷ 100 per min — this is the number that matters, not a compute estimate |
 | Concurrent bulk jobs worth planning for | 1–2 | the 100/min budget is shared system-wide; more concurrent jobs don't finish faster, they just interleave against the same ceiling |
 | In-flight line items, worst case | ~4,500–9,000 | one or two max-size jobs in flight at once |
+| LDAP existence-check calls, uncached, 4,500-order job | up to 9,000 | once at validate (dry-run) + once at order, per line — worth caching even within one job |
+| FTE-check calls, uncached, 4,500-order job | up to 9,000 | 2 owners × 4,500 lines, before dedup |
+| Distinct owners in a 4,500-order job (assumed) | ~50–200 | owner reuse assumption (§1) — this is the number that makes caching worth building |
+| FTE-check calls, **cached** (owner-id → TTL) | ~50–400 | one lookup per distinct owner, not per line — a ~95%+ reduction if the reuse assumption holds |
+
+Neither the LDAP nor the FTE-check API's own rate limit/SLA is stated (§9) —
+the estimates above are exactly why this design caches both rather than
+assuming either can absorb 9,000 calls per bulk job without being asked to.
 
 **What the numbers force:**
 - **The rate limit, not our own compute, is now the entire story.** A worker
@@ -144,8 +178,13 @@ caller explicitly forces a re-order.
   budget**, not just dispatch ordering (see §6).
 - The payload/storage numbers above are small enough that neither inline-vs-
   upload ingestion (§3) nor the order store (§5) is a scaling concern at this
-  volume — the rate limit is the only real bottleneck, at every scale up to
-  and including 4,500.
+  volume — the rate limit is the only real bottleneck for AD-provisioning
+  calls specifically.
+- **The validation-side calls (LDAP existence, FTE) need their own
+  bottleneck story, separate from the 100/min limit** — nothing says those
+  APIs tolerate 9,000 calls per bulk job. Caching (§3.2/§5) is the mitigation
+  that's actually in this design's control, independent of what those APIs'
+  real limits turn out to be.
 
 ## 3. API & CLI (entry points)
 
@@ -194,40 +233,64 @@ POST /v1/orders:validate
 {
   "valid": false,
   "checks": {
-    "name_policy":     { "ok": true },   // naming convention/format/length
-    "primary_owner":   { "ok": true },   // valid, permitted AD principal
-    "secondary_owner": { "ok": false, "code": "same_as_primary_owner" }
+    "name_policy":     { "ok": true },                       // regex/format/length — local, no API call
+    "primary_owner":   { "ok": true, "source": "cache" },     // format regex, then active-FTE check
+    "secondary_owner": { "ok": false, "code": "not_active_fte", "source": "api" }
   },
   "errors": [
-    { "field": "secondary_owner", "code": "same_as_primary_owner",
-      "message": "secondary_owner must be a different principal than primary_owner." }
+    { "field": "secondary_owner", "code": "not_active_fte",
+      "message": "bob@corp.com is not an active full-time employee." }
   ],
-  "duplicate": { "already_ordered": false }   // informational — would SKIP on order, not fail validation
+  "availability": { "status": "not_found" }   // not in our order store, not in LDAP — informational, would proceed to order
 }
 ```
 
-- `name_policy`, `primary_owner`, and `secondary_owner` are the **blocking**
-  checks: any failing one is what the order pipeline reports as
-  `validation_failed` — the `errors` array (field/code/message, same shape as
-  the API's standard error envelope) is exactly what a `validation_failed`
-  order response carries.
-- `duplicate` is reported separately and is **not** a validation failure —
-  ordering an already-ordered group isn't invalid input, it's a request the
-  pipeline *skips* (req. 6, §3.3). It's included here only so a dry-run
-  caller can see it coming.
-- Each blocking check is also independently reachable
-  (`POST /v1/validations/name-policy`, `/v1/validations/primary-owner`,
-  `/v1/validations/secondary-owner`) for callers that only need one.
-  `orders:validate` and the order pipeline's step 1 are **the same
-  implementation** — "it validated" and "it orders" can't drift apart.
-- The `duplicate` check here is **advisory**: it reflects our order store at
-  read time. The authoritative check is the one the create path performs
-  under the DB's unique constraint (§5) — a dry run showing "not a duplicate"
-  can still lose a race to a concurrent submission, which is why the actual
-  order response (not just validate) is what a caller must trust for the
-  final outcome.
-- Bulk dry-run: `POST /v1/order-jobs?mode=validate_only` (see 3.3) — same
-  ingestion shape, no orders are created, results carry per-line `checks`.
+Each owner check is really **two checks run in order**, cheapest first:
+1. **Format** — a regex over the id (email/employee-id shape, §1) — local,
+   free, no API call, no caching needed.
+2. **Active FTE** — only run if the format passed; calls the FTE-check API,
+   **cached** by owner id (§5) so 4,500 lines sharing ~50–200 distinct owners
+   (§2) cost ~50–200 API calls, not ~9,000.
+
+`name_policy` and both owner checks are the **blocking** validation checks —
+any failing one is what the order pipeline reports as `validation_failed`;
+the `errors` array (field/code/message) is exactly what that order response
+carries.
+
+`availability` replaces the earlier "duplicate" check and now has three
+possible outcomes, checked cheapest-first so a request that's going to be
+skipped never pays for an owner/FTE check it doesn't need:
+- **`already_ordered`** — found in *our own order store* (fast DB read, no
+  API call) → the order will be `skipped`, pointing at the existing order.
+- **`exists_in_ad`** — not in our store, but the **LDAP existence-check API**
+  says the group is already there (§4) — this is what catches a group
+  created outside this process entirely (no longer out of scope, unlike the
+  earlier draft). Also `skipped`, but with no `existing_order_number` to
+  point to (§3.3) — nothing here ordered it. **Cached** by group name with a
+  short TTL (§5), mainly so a validate-then-order round trip for the same
+  line doesn't hit LDAP twice.
+- **`not_found`** — neither store has it; the order can proceed.
+
+`availability` is reported separately from the blocking checks and is **not**
+a validation failure — ordering an already-existing group isn't invalid
+input, it's a request the pipeline *skips* (req. 6, §3.3).
+
+Each blocking check is also independently reachable
+(`POST /v1/validations/name-policy`, `/v1/validations/primary-owner`,
+`/v1/validations/secondary-owner`) for callers that only need one.
+`orders:validate` and the order pipeline's step 1 are **the same
+implementation** — "it validated" and "it orders" can't drift apart.
+
+The `availability` check here is **advisory**: it reflects a point-in-time
+read (possibly cached) of our order store and LDAP. The authoritative check
+is the one the create path performs — the DB's unique constraint for
+`already_ordered` (§5), and the AD create call itself for `exists_in_ad`
+(§3.3's `force=true` note) — a dry run showing `not_found` can still lose a
+race, which is why the actual order response is what a caller must trust for
+the final outcome.
+
+Bulk dry-run: `POST /v1/order-jobs?mode=validate_only` (see 3.3) — same
+ingestion shape, no orders are created, results carry per-line `checks`.
 
 ### 3.3 Order — one, a few, or 4,500
 
@@ -242,17 +305,21 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
 201 Created
 { "order_number": "ord_88213", "status": "succeeded", "group_name": "GRP-Finance-ReadOnly" }
 
-200 OK   // group already ordered, force not set — order is skipped, not an error
+200 OK   // found in our own order store, force not set — order is skipped, not an error
 { "order_number": "ord_77190", "status": "skipped", "group_name": "GRP-Finance-ReadOnly",
   "reason": "already_ordered" }
 
-422 Unprocessable Entity   // step 1 of the pipeline (§4) — no AD call was made
+200 OK   // not in our store, but LDAP says the group already exists — created outside this process
+{ "order_number": "ord_88219", "status": "skipped", "group_name": "GRP-Legacy-Ops",
+  "reason": "exists_in_ad" }   // no existing_order_number — nothing here ordered it (§9)
+
+422 Unprocessable Entity   // step 1 of the pipeline (§4) — no AD call, no FTE-check call was made
 { "order_number": "ord_88214", "status": "validation_failed", "group_name": "GRP-Ops-!!invalid",
   "reason": [
     { "field": "group_name", "code": "invalid_group_name",
       "message": "Group name may not contain '!' and must start with 'GRP-'." },
-    { "field": "secondary_owner", "code": "same_as_primary_owner",
-      "message": "secondary_owner must be a different principal than primary_owner." }
+    { "field": "secondary_owner", "code": "not_active_fte",
+      "message": "bob@corp.com is not an active full-time employee." }
   ] }
 
 502 Bad Gateway   // input was valid, the group wasn't a duplicate — the downstream AD call itself failed
@@ -329,10 +396,10 @@ GET /v1/orders/{order_number}                # lookup by order number
 GET /v1/orders?group_name=GRP-Finance-ReadOnly # lookup by group name (req. 5) — returns the latest order for that name
 ```
 
-`GET /v1/orders?group_name=...` is the same lookup the duplicate check (§3.2)
-and the create-path dedupe (§5/§6) use internally — one more place the
-"skip if already ordered" rule and "look it up by group name" requirement
-share a single implementation.
+`GET /v1/orders?group_name=...` is the same lookup the `availability` check's
+`already_ordered` branch (§3.2) and the create-path dedupe (§5/§6) use
+internally — one more place the "skip if already ordered" rule and "look it
+up by group name" requirement share a single implementation.
 
 ### 3.5 CLI
 
@@ -388,35 +455,39 @@ running server-side — `--watch` can be resumed against the same `job_id`).
                             │                      ▼
                             │            ┌──────────────────┐
                             └───────────▶│ Order pipeline    │  (shared code path §3.2/3.3)
-                                         │  1. validate (name-policy,
-                                         │     primary_owner, secondary_owner)
-                                         │     → validation_failed if any
-                                         │     check fails, no AD call made
-                                         │  2. duplicate check (unique
-                                         │     constraint is authoritative)
-                                         │     → skipped if already ordered
-                                         │  3. acquire a token from the
+                                         │  1. name-policy + owner id-format
+                                         │     regex (local, no API call)
+                                         │  2. availability: our order store,
+                                         │     then LDAP existence check
+                                         │     (cache-backed) → skipped
+                                         │  3. FTE check: primary_owner,
+                                         │     secondary_owner (cache-backed)
+                                         │     → validation_failed if either
+                                         │     check (1/3) fails — no AD
+                                         │     call, no token spent
+                                         │  4. acquire a token from the
                                          │     shared 100/min rate limiter
-                                         │     (blocks/queues here, not on
-                                         │     AD's own 429s)
-                                         │  4. AD group-create (owners set)
+                                         │  5. AD group-create (owners set)
                                          │     → failed on downstream error
-                                         │  5. persist order (succeeded/
+                                         │  6. persist order (succeeded/
                                          │     validation_failed/failed/skipped)
-                                         └────────┬──────────┘
-                                                  ▼
-                                     ┌────────────────────────┐
-                                     │ orders / order_jobs /   │      ┌───────────────────┐
-                                     │ order_job_items store   │      │ Shared rate limiter │
-                                     │ (single relational DB,  │◀────▶│ (100 req/min token  │
-                                     │ e.g. PostgreSQL — §5)   │      │ bucket, sync-        │
-                                     └────────────────────────┘      │ reserved slice)      │
-                                                  │                  └───────────────────┘
-                                                  ▼
-                                     ┌────────────────────────┐
-                                     │ AD / directory          │  (downstream — out of scope, §1)
-                                     │ provisioning API        │
-                                     └────────────────────────┘
+                                         └───┬─────────┬──────┬──────┘
+                                             ▼         ▼      ▼
+                          ┌────────────────────┐ ┌──────────┐ ┌───────────────────┐
+                          │ orders/order_jobs/  │ │ Cache     │ │ Shared rate limiter │
+                          │ order_job_items      │ │ (Redis or │ │ (100 req/min token  │
+                          │ store (single         │ │ equiv.):  │ │ bucket, sync-        │
+                          │ relational DB, e.g.   │ │ LDAP+FTE  │ │ reserved slice)      │
+                          │ PostgreSQL — §5)       │ │ results,  │ │  — §4/§6            │
+                          │                        │ │ TTL — §5  │ │                    │
+                          └────────────────────┘ └─────┬────┘ └───────────────────┘
+                                             │           │ (on miss)
+                                             ▼           ▼
+                          ┌────────────────────┐ ┌────────────────────────────┐
+                          │ AD / directory       │ │ LDAP existence-check API /  │
+                          │ provisioning API      │ │ Active-FTE-check API        │
+                          │ (out of scope, §1)    │ │ (out of scope, §1)          │
+                          └────────────────────┘ └────────────────────────────┘
 ```
 
 - **API gateway** — authn/authz, rate limiting per caller (protects the
@@ -425,22 +496,32 @@ running server-side — `--watch` can be resumed against the same `job_id`).
   the bulk workers call per line — this is what makes §3.2's "one code path"
   claim true, and what makes partial-failure isolation (§1) fall out for
   free: each line runs the pipeline independently and reports its own
-  result. Validation (step 1) always runs as part of placing the order, not
-  as a prerequisite the caller must remember — a caller who *did* call
+  result. Validation (steps 1–3) always runs as part of placing the order,
+  not as a prerequisite the caller must remember — a caller who *did* call
   `orders:validate` first gets no special treatment; the order call
-  re-validates anyway, so "it validated" can never go stale by the time the
-  order is actually placed. Step 2 (duplicate check) likewise always
-  re-verifies against the unique constraint at persist time, never trusting
-  an earlier dry-run result (§3.2).
+  re-validates anyway (against the cache, so this is cheap — see below), so
+  "it validated" can never go stale by the time the order is actually
+  placed. Steps ordered cheapest-and-most-decisive first: local regex, then
+  availability (which can end the request in a `skipped` before any owner
+  gets checked), then the FTE calls, then the scarce rate-limited AD call
+  last of all — nothing expensive runs for a request that's going to be
+  rejected or skipped anyway.
 - **Line-item queue** has (at least) two lanes/priorities — sync-path calls
   don't sit behind a 4,500-line job (§2's fairness requirement) — a
   `task-scheduling` priority-queue concern, not a new component.
+- **Cache** sits in front of the LDAP existence-check and FTE-check APIs
+  (§2/§5/§6) — a `caching` building block, cache-aside, TTL-evicted (neither
+  upstream system pushes invalidation events). It's what turns ~9,000
+  potential calls per 4,500-order bulk job into a few hundred (§2). Can share
+  infrastructure with the rate limiter operationally, but the two are
+  logically separate: one throttles a scarce write budget, the other avoids
+  redundant reads.
 - **Shared rate limiter** is the component §2's numbers actually demand: one
   token bucket, refilled at 100/min, that every downstream AD call (sync or
   bulk) acquires a token from before dispatch — not per-worker limiting,
   which would either over- or under-count the real budget. A small slice of
   the bucket is reserved for the sync lane (§6) so a big bulk job can't starve
-  single-order latency. Lives alongside the queue, not inside the DB.
+  single-order latency.
 - **Blob store** exists only for the upload path (>500 lines) — a
   `blob-store` building block, not a bespoke file service.
 - **Order store** is a single relational database (PostgreSQL or equivalent)
@@ -504,6 +585,25 @@ sharding story needed, ever, at this design's scale (see §8).
   stored response, TTL 24h, per the standard `api-design` idempotency
   state-machine (pending/complete, reject on same-key-different-body).
 
+**Cache (separate from the relational store above — e.g. Redis, not a DB
+table):** two namespaces, both cache-aside with a TTL (neither upstream
+system offers invalidation events, so TTL expiry is the only eviction
+mechanism):
+- `fte:{owner_id} → active|inactive`, **TTL ~15 minutes.** Long enough that
+  a 4,500-line job's owner reuse (§2) collapses to ~50–200 calls; short
+  enough to bound the real risk here — a cached `active` for someone
+  terminated moments ago would let a stale cache approve an owner the live
+  API would reject. This is a **genuine staleness risk**, not a
+  self-correcting one (AD itself doesn't care who the owner is), which is
+  why the TTL is the main lever and is called out again in §9.
+- `ldap_exists:{group_name} → found|not_found`, **TTL ~60 seconds.** Short —
+  its only real job is avoiding a duplicate LDAP round trip between a
+  validate-then-order pair for the same line (§3.2), not surviving across a
+  whole bulk job. Staleness here is **self-correcting**: a stale `not_found`
+  just means the AD create call itself rejects the group as already
+  existing (§3.3) — worse UX (`failed` instead of a clean `skipped`), not a
+  correctness bug, because AD's own uniqueness is still the backstop.
+
 Group-name lookup (`GET /v1/orders?group_name=...`, req. 5) is served by the
 `group_name` index above — the same index that enforces the duplicate-skip
 rule, so "look up by group name" and "detect it's already ordered" are the
@@ -522,6 +622,9 @@ every access pattern here is job-scoped.
 |---|---|---|---|
 | Validation is step 1 of the order pipeline (runs on every order call), not a required separate step | Callers can't forget to validate; a `validation_failed` reason is always in the order response itself, no extra round trip needed | The order call always pays validation cost, even for a line dry-run-checked moments earlier — no way to present a "trust me, already validated" token | Blocking checks become expensive enough that skipping a repeat check is worth the complexity → add an optional skip token then |
 | `validation_failed` and `failed` as distinct order statuses | A caller can branch on "fix the request" vs "safe to retry" without parsing error codes (req. 1/5) | One more status value in every enum/consumer (job counts, CLI filters, data model) | Never — this is exactly the distinction the requirement asks for |
+| LDAP existence check added to validation (not just our own order store) | Closes the "group created outside this process" gap — previously out of scope, now actually detected (§1) | A second external dependency validation now waits on, alongside the FTE check | Never — this is the fix for exactly that gap |
+| Cache both the LDAP existence check and the FTE check, cache-aside with TTL | Cuts ~9,000 potential calls/4,500-order job to a few hundred for FTE (owner reuse, §2), and avoids a duplicate LDAP call on validate-then-order for the same line | Two staleness windows to reason about — bounded but real for FTE (§5), self-correcting for LDAP (§5) | The FTE TTL's staleness risk becomes unacceptable to the business → shorten it or drop caching for that check specifically, not both |
+| Validation steps ordered cheapest/most-decisive first (regex → availability → FTE → rate-limited AD call) | A request that's going to be skipped or rejected never spends an FTE-check call or a scarce rate-limit token on itself | The pipeline has more sequential stages, and their order is now a meaningful design choice, not incidental | Never — reordering would spend the scarcest resources (rate-limit tokens, and calls to APIs whose own limits are unstated, §9) on doomed requests |
 | Sync endpoint (≤25) + separate async job endpoint (up to 4,500+) | Keeps single-order latency low; lets bulk scale independently | Two code paths to keep behaviorally identical (mitigated: both call the same order pipeline, §4) | The sync cutover (25) is wrong for real traffic → tune, don't redesign |
 | `group_name` as the dedupe/business key (no separate `external_id`) | One fewer field to require from callers; "look up by group name" and "already ordered" share one index (§5) | Renaming a group later has no clean story here (out of scope, §1) — the key is fixed at order time | A second domain is ever added → key must become `(domain, group_name)`, since §1 confirms single-domain today |
 | A single shared rate limiter (one 100/min token bucket), not per-worker limiting | Correctly enforces the real, confirmed constraint (§2) regardless of worker-pool size — adding workers can't accidentally over-spend the budget | Every call path (sync and bulk) now depends on one shared piece of state — it must be fast and available, or nothing can place an order (→ §7) | Never, while the limit is a single system-wide number; if AD ever exposes per-tenant quotas, the bucket becomes per-tenant |
@@ -537,12 +640,28 @@ every access pattern here is job-scoped.
 
 ## 7. Failure modes & degradation
 
-- **Invalid input** (bad group-name format, an unknown/unpermitted
-  `primary_owner` or `secondary_owner`, or the two owners being the same
-  principal) — caught at step 1 of the pipeline, before any downstream call
-  is made or any rate-limit token spent. Returns `validation_failed` with the
-  specific field/code/message immediately — this is the case the
-  "validation happens as part of the order" requirement targets directly.
+- **Invalid input** — bad group-name format, a malformed owner id (regex),
+  or an owner who **is not an active full-time employee** — caught at steps
+  1–3 of the pipeline. A format failure never reaches the FTE-check API at
+  all (cheapest check first, §6); an FTE failure means the check *ran* and
+  came back negative, which is why it's `validation_failed` (fixable,
+  non-retryable) and not `failed` — the distinction only holds because the
+  check actually completed. Returns the specific field/code/message
+  immediately — no AD call, no rate-limit token spent either way.
+- **The FTE-check or LDAP existence-check API errors outright** (times out,
+  5xx — as opposed to a definitive "not active" / "exists" answer) — this is
+  **not** the same as a validation failure, because the check never actually
+  ran to completion: the order comes back `failed` with `retryable: true`,
+  same treatment as an AD provisioning error (`resilience-failure`: timeout +
+  circuit breaker per dependency). Conflating "the check said no" with "the
+  check couldn't run" would misclassify a transient outage as the caller's
+  fault.
+- **The cache is unavailable** — fail **open**, not closed: the pipeline
+  calls the LDAP/FTE APIs directly rather than blocking orders on a cache
+  outage, since the cache is a load-reduction optimization (§5/§6), not a
+  correctness mechanism. The cost is degraded — higher latency, and the full
+  ~9,000-call load (§2) lands on APIs whose own capacity is unconfirmed
+  (§9) — worth alerting on, not silently absorbing indefinitely.
 - **The rate limiter itself is unavailable** (§4's shared token bucket is
   down or unreachable) — this is now a real dependency every order goes
   through, sync or bulk (§6). Fail closed: orders return a `retryable: true`
@@ -631,6 +750,12 @@ constraint (§2/§6):
   SLA, or the rate limiter's queue depth growing without bound — either means
   the 100/min ceiling itself needs renegotiating before volume grows further,
   not a scaling fix on this API's side.
+- **The caching assumption also needs re-checking at 10×.** §2's ~50–200
+  distinct-owner estimate for a 4,500-line job is an assumption about owner
+  reuse (§1) — a 45,000-line job doesn't necessarily have 10× the reuse; if
+  distinct owners scale with order count instead, the FTE-check cache's hit
+  rate (and its protection of that API) degrades exactly when it's needed
+  most. Watch cache hit rate as its own metric, not just job completion time.
 
 ## 9. Open questions
 
@@ -639,13 +764,21 @@ constraint (§2/§6):
   `failed` without needing `force`. Confirm this matches intent — if a
   failed order should also require `force` to retry, the unique-index
   predicate in §5 changes from excluding `failed` to including everything.
-- **Drift detection** (§1, out of scope): a group created directly in AD,
-  bypassing this API, has no order record — `orders:validate`'s duplicate
-  check won't see it, and a subsequent order would attempt creation and get
-  a `group_already_exists_in_ad` failure from the downstream call, not a
-  clean `skipped`. Worth deciding whether that failure should be
-  auto-reclassified as `skipped` once observed, or left as a failure for a
-  human to reconcile.
+- **Should an `exists_in_ad` skip backfill an order record?** (§1's now-
+  narrower out-of-scope item) The LDAP check catches a group created outside
+  this process at validation time, and it's cleanly `skipped` (§3.2/§3.3) —
+  but no `order_number` exists for it to point to. Worth deciding whether to
+  synthesize a historical order record at that point (so a later
+  `GET ?group_name=...` finds *something*), or leave it as a `skipped` order
+  with no back-reference, as designed here.
+- **What are the LDAP existence-check and FTE-check APIs' own rate limits/
+  SLAs?** Unstated (§1/§2) — the caching design (§5/§6) is this system's own
+  mitigation regardless of the answer, but the cache TTLs and whether a
+  circuit breaker is even needed depend on it.
+- **Is 15 minutes the right FTE-cache TTL?** (§5) It trades "fewer calls" for
+  "a just-terminated employee could still be accepted as an owner for up to
+  that long." This is a business/compliance call, not a technical one —
+  confirm the acceptable staleness window.
 - **Is the 100/min limit truly one global ceiling**, or actually per
   app-registration/service-principal in a way that would let a second
   registration double the effective budget? This design assumes one shared
@@ -657,6 +790,9 @@ constraint (§2/§6):
   enforced, and whether AD's own `owners` semantics distinguish "primary"
   from "secondary" at all, or whether that distinction is purely this
   system's metadata (§3.1).
+- **Exact owner-id regex** — assumed to be an email/employee-id shape (§1);
+  the real pattern (and whether `primary_owner`/`secondary_owner` must be
+  the same *kind* of identifier) needs the actual policy.
 - Auth model (API key vs. OAuth client-credentials, and how `primary_owner`/
   `secondary_owner` are authorized to receive a new group) — assumed but not
   designed; doesn't change the shapes above either way.
@@ -673,11 +809,13 @@ constraint (§2/§6):
       exact group name, §3.4, not full-text search); logs/SLOs — deferred to
       `observability`/`distributed-logging`, not re-derived here.
 
-**Weakest dimension:** §9's open questions are now the design's real risk
-surface — whether "already ordered" should include failed attempts, whether
-the 100/min limit is truly one global ceiling (vs. per-registration, which
-would reshape the rate-limiter design), and whether `secondary_owner !=
-primary_owner` should actually be enforced. None of these are scale
-questions anymore (§2/§8 are about as settled as a design can be once a hard
-rate limit is confirmed) — they're behavioral defaults this design chose and
-should be confirmed before implementation.
+**Weakest dimension:** the two APIs this design now depends on for
+validation — LDAP existence-check and active-FTE-check — have **unstated
+capacity** (§1/§2/§9). Every number in §2 for them (9,000 uncached calls,
+~50–200 cached) is this design's own estimate of the load it will offer, not
+a confirmed budget those systems can absorb; the caching strategy (§5/§6) is
+built to reduce that load regardless, but whether it reduces it *enough*
+can't be confirmed until those APIs' real limits are known. §9's other
+open questions (already-ordered-on-failed-attempts, the FTE-cache TTL,
+whether the 100/min limit is truly global) are the design's next-most
+load-bearing choices, but all are second to this one.
