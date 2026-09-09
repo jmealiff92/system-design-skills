@@ -10,8 +10,20 @@ this design lives in `examples/itrs-gateway-event-relay/`.
 > against the live page (`geneos_rulesactionsalerts_tr` → *Effects*) at
 > write time. The design deliberately does not depend on getting that list
 > perfectly right (see §3 and §5) — verify the real names with one throwaway
-> rule that runs `env > /tmp/env.dump` before go-live, then adjust `VAR_MAP`
-> in `itrs_notify.py`.
+> rule that runs `env > /tmp/env.dump` before go-live, then adjust `varMap`
+> in `cmd/itrs-notify/main.go`.
+
+> **Revision note.** The original draft of this design chose a stdlib-only
+> Python script for `itrs-notify`, on the reasoning that "no dependency to
+> install" was the whole story. A later constraint invalidated that:
+> **~80 Gateway hosts across multiple regions**, with no guarantee they run
+> the same, or any, Python environment. That's the `system-design` skill's
+> "treat the architecture as a hypothesis" discipline in practice — a new
+> fact changed a decision, so the decision changed, not just the code. Both
+> `itrs-notify` and `event-relay` are now Go, built as static binaries; see
+> §6 and the language note at the top of `examples/itrs-gateway-event-relay/README.md`
+> for the reasoning. The architecture (§4) did not need to change — only
+> the implementation language of the two components it already called for.
 
 ## 1. Problem & scope
 
@@ -25,6 +37,10 @@ every trigger to a downstream Event Management System (EMS) as an HTTP POST.
   rules, samplers, and/or multiple Gateway hosts) can invoke the script at
   the same time — there is no single caller to serialize behind.
 - **Latency < 500 ms.**
+- **~80 Gateway hosts, in different regions**, each independently forking
+  the trigger program — no shared provisioning is assumed between them.
+  This is what rules out relying on a language runtime being present, let
+  alone at a consistent version (§6).
 
 **Out of scope:** the EMS's own ingestion design (assumed to be a normal
 HTTP API); Geneos Gateway HA/config; historical backfill/replay tooling
@@ -85,10 +101,10 @@ script:
    (forward-compatible — nothing is dropped even if a name is wrong or a
    version adds new ones), and
 2. additionally lifts the commonly-used ones into named top-level fields via
-   a single editable table (`VAR_MAP` in `itrs_notify.py`) for the fields an
-   EMS integration typically wants to query/alert on: severity, headline,
-   managed entity, sampler, dataview, row/column/value, gateway, probe,
-   rule/variable name, timestamp.
+   a single editable table (`varMap` in `cmd/itrs-notify/main.go`) for the
+   fields an EMS integration typically wants to query/alert on: severity,
+   headline, managed entity, sampler, dataview, row/column/value, gateway,
+   probe, rule/variable name, timestamp.
 
 This is deliberate: the exact spelling is the one fact in this design that
 could not be verified against the live docs from this sandbox (see the note
@@ -149,20 +165,20 @@ actually landed but whose ack was lost.
 ## 4. High-level design
 
 ```
-Geneos rule/alert fires (N processes, possibly many hosts, up to 1,000/s)
+Geneos rule/alert fires (N processes, possibly 80 hosts across regions, up to 1,000/s)
         │  fork+exec
         ▼
- itrs_notify.py  (per-trigger, stdlib-only, no network)
+ itrs-notify  (per-trigger, static Go binary, no network, no runtime deps)
     - reads env, builds envelope + event_id
     - tries UDS write to local relay daemon (~ms, short timeout)
     - on any failure: appends one line to local spool file instead
-    - exits — wall-time dominated by interpreter start, not the network
+    - exits — wall-time dominated by fork/exec, not an interpreter or the network
         │ UDS                                  │ disk (fallback path)
         ▼                                       │
- event_relay.py  (one long-running daemon per Gateway host)
-    - bounded in-memory queue (backpressure: NACK → client spools instead)
+ event-relay  (one long-running daemon per Gateway host, static Go binary)
+    - bounded in-memory queue/channel (backpressure: NACK → client spools instead)
     - spool-drainer tails the disk spool (crash recovery + NACK fallback)
-    - N worker coroutines, shared pooled HTTP client (keep-alive/HTTP2)
+    - N worker goroutines, shared pooled HTTP client (keep-alive, stdlib net/http)
     - per-attempt timeout + capped retry+jitter (resilience-failure)
     - circuit breaker around the EMS endpoint
     - exhausted retries / breaker-open → dead-letter file
@@ -194,10 +210,11 @@ Each component ties back to a number or requirement from §1–§2:
 ### The two latency budgets, sized
 
 1. **Script wall-time** (what the Gateway host/effect timeout sees):
-   interpreter start (~20–40 ms) + env parsing (µs) + UDS write/ack
-   (~1–5 ms, local socket) ≈ **well under 500 ms, and independent of the
-   EMS's health** — this is the actual win: Gateway never waits on the
-   network call.
+   fork/exec + a static Go binary's own start (measured well under 1 ms,
+   vs. tens of ms for a scripting-language interpreter — see the README)
+   + env parsing (µs) + UDS write/ack (~1–5 ms, local socket) ≈ **well
+   under 500 ms, and independent of the EMS's health** — this is the
+   actual win: Gateway never waits on the network call.
 2. **End-to-end delivery latency** (trigger → EMS ack), budgeted under
    500 ms P99: per-attempt timeout 150 ms (connect+read) → one retry with
    ~50–150 ms jittered backoff → worst case ~350–400 ms for two attempts,
@@ -206,8 +223,8 @@ Each component ties back to a number or requirement from §1–§2:
 
 Concurrency sizing (Little's Law, §2): **N ≈ 1,000/s × 0.15 s ≈ 150**
 in-flight requests needed to sustain peak within the per-attempt budget; the
-daemon runs a pooled client with headroom (`WORKER_CONCURRENCY = 200`,
-`max_keepalive_connections ≈ 200`).
+daemon runs a pooled client with headroom (`ITRS_RELAY_WORKERS = 200`,
+`MaxIdleConnsPerHost ≈ 200`).
 
 ## 5. Data model
 
@@ -217,14 +234,16 @@ persistence the requirement doesn't call for). The only on-disk structures:
 - **Spool file** (`pending.jsonl`) — append-only, one JSON record per line,
   each record written with a single `write()` under `PIPE_BUF` (4096 B) so
   POSIX guarantees the append is atomic even with many concurrent writers
-  (many `itrs_notify.py` processes falling back at once need no file
-  locking). Truncate the `attributes` blob rather than break this guarantee
-  — documented trade-off in the code.
+  (many `itrs-notify` processes falling back at once need no file locking).
+  Truncate the `attributes` blob rather than break this guarantee —
+  documented trade-off in the code (`internal/spool`, shared by both
+  binaries — safe to share in Go since it's compiled into each static
+  binary at build time, not deployed as a sibling file that could drift).
 - **DLQ file** (`dead_letter.jsonl`) — same shape plus `failure_reason` and
   `attempts`, for events that exhausted retries or hit a permanent (4xx)
   rejection. Operator-inspectable and replayable.
 
-`event_id` (UUID4, minted in `itrs_notify.py`) is the natural primary key
+`event_id` (UUID4, minted in `itrs-notify`) is the natural primary key
 across every hop — spool line, queue item, DLQ record, and the
 `Idempotency-Key` the EMS sees — so a record can be traced end to end.
 
@@ -236,8 +255,8 @@ across every hop — spool line, queue item, DLQ record, and the
 | UDS + disk-spool fallback for the hand-off | Script never blocks on the network; local socket write is ~ms regardless of EMS health | At-least-once only (ack = "queued," not "delivered"); a message can be duplicated across spool-replay + in-flight retry | An EMS-side dedupe on `Idempotency-Key` isn't available — then durability needs a stronger local guarantee |
 | Bounded in-memory queue, NACK-and-spool when full | Backpressure — a stalled EMS can't grow memory without bound or block new triggers | A full queue pushes load onto disk I/O; spool-drain adds recovery-path complexity | Sustained rate consistently exceeds spool disk throughput — then the daemon itself needs sharding across hosts |
 | Circuit breaker around the EMS call | Fails fast during an EMS outage instead of piling retries onto a dead endpoint | Adds a state machine to tune (open/half-open thresholds); can trip on a real but transient blip | Breaker flaps under normal jitter — loosen the error-rate threshold or lengthen the window |
-| Capture all `_`-prefixed env vars into `attributes`, map known ones by a table | Forward-compatible if the exact Geneos variable names are wrong or change across versions (this sandbox couldn't verify them live) | The mapped top-level fields may be empty/wrong until `VAR_MAP` is confirmed against a real Gateway | After the first live test — pin `VAR_MAP`, keep `attributes` as the safety net |
-| Python (stdlib-only) for the per-trigger script | No dependency install needed on the Gateway host; matches this repo's "no runtime deps" bias | ~20–40 ms interpreter startup × up to 1,000 forks/s is real CPU/RSS churn on the Gateway host | Gateway host CPU/RSS from process churn becomes the bottleneck — see §8 |
+| Capture all `_`-prefixed env vars into `attributes`, map known ones by a table | Forward-compatible if the exact Geneos variable names are wrong or change across versions (this sandbox couldn't verify them live) | The mapped top-level fields may be empty/wrong until `varMap` is confirmed against a real Gateway | After the first live test — pin `varMap`, keep `attributes` as the safety net |
+| Go, static binaries (`CGO_ENABLED=0`), for both `itrs-notify` and `event-relay` | No interpreter/runtime version to match across ~80 hosts in different regions (the deciding factor — see the revision note); sub-ms process start vs. tens of ms for a scripting-language interpreter at up to 1,000 forks/s; stdlib `net/http` gives connection pooling for free, so `event-relay` also needs zero third-party dependencies | A compiled/typed language: a `varMap` fix or schema tweak needs a rebuild + redeploy of the binary, not a hand-edit on a live host; cross-compiling for any non-amd64 region needs a `GOOS`/`GOARCH` build matrix in CI | Never, given the 80-host constraint — the same environment-drift argument only gets stronger with more regions, not weaker |
 
 ## 7. Failure modes & degradation
 
@@ -247,8 +266,8 @@ across every hop — spool line, queue item, DLQ record, and the
   Gateway-visible latency is unaffected either way (§4) — the degradation is
   *invisible upstream* and only shows up as growing spool/DLQ depth, which
   is exactly what's alarmed on (§9).
-- **Relay daemon is down or restarting.** `itrs_notify.py`'s UDS connect
-  fails fast (short timeout) and falls back to the disk spool; no events are
+- **Relay daemon is down or restarting.** `itrs-notify`'s UDS connect fails
+  fast (short timeout) and falls back to the disk spool; no events are
   lost, they're just delayed. On restart, the daemon's spool-drainer replays
   the backlog through the same bounded queue/breaker path — no thundering
   herd into the EMS, because replay respects the same backpressure as live
@@ -260,33 +279,46 @@ across every hop — spool line, queue item, DLQ record, and the
   guidance).
 - **Disk fills up** (spool/DLQ growing faster than they drain). This is the
   one true data-loss risk in the design and is deliberately not silently
-  papered over: `itrs_notify.py`'s write to a full disk raises, is caught,
-  and logged to stderr — the event is dropped rather than hanging the
-  Gateway effect. Alarm on spool file size/age (§9) well before this point.
+  papered over: `itrs-notify`'s write to a full disk returns an error, is
+  caught, and logged to stderr — the event is dropped rather than hanging
+  the Gateway effect. Alarm on spool file size/age (§9) well before this
+  point.
 - **Gateway host itself is overloaded by process churn** (§8) — the
-  daemon/EMS are healthy but the Gateway can't fork fast enough. Out of this
-  design's control at the code level; the mitigation is host sizing / a
-  lighter-weight trigger binary, called out as the scale-evolution item.
+  daemon/EMS are healthy but the Gateway can't fork fast enough. Choosing
+  Go for `itrs-notify` (§6) removes the interpreter-startup share of this
+  cost, but not the OS-level fork/exec cost itself — see §8 for what's
+  actually left to do if this shows up.
 
 ## 8. Scale evolution
 
 Current bottleneck at 1,000 events/s: **process-creation overhead on the
-Gateway host**, not the network hop or the EMS (§2). At the next order of
-magnitude (10×, 10,000 events/s):
-- 10,000 Python interpreter starts/second is a real host-CPU cost even
-  though each one is brief; the fix is to shrink the per-trigger program to
-  near-zero startup, e.g. a small statically-linked binary (Go/Rust) or a
-  tiny C program that does the same "read env → UDS write → exit," instead
-  of scaling out anything downstream — `event_relay.py` and the EMS contract
-  don't need to change at all, only what Geneos forks.
+Gateway host**, not the network hop or the EMS (§2) — and choosing Go for
+`itrs-notify` (§6) addresses the *interpreter-startup* share of that cost,
+not the OS-level fork/exec syscall cost, which any external program pays
+regardless of language. At the next order of magnitude (10×, 10,000
+events/s):
+- 10,000 fork/exec calls/second is still meaningful kernel-side work (page
+  table setup, context switches) even with a sub-millisecond static binary.
+  If Gateway-host load starts tracking event rate rather than headroom,
+  the next lever isn't the trigger program's language (already addressed)
+  — it's whether Geneos offers any way to batch or hold a persistent
+  channel per Gateway instead of one process per trigger; if not, this
+  becomes a host-sizing conversation, not a code change.
 - If a single relay daemon's worker pool can't sustain the higher rate,
-  raise `WORKER_CONCURRENCY`/pool limits first (cheap); only shard into
-  multiple daemons per host (e.g. one per NUMA node / CPU group) if a single
-  process's event loop is provably the ceiling.
+  raise `ITRS_RELAY_WORKERS`/pool limits first (cheap); only shard into
+  multiple daemons per host (e.g. one per NUMA node / CPU group) if a
+  single process is provably the ceiling — Go's goroutines scale well
+  past the ~200 default before this becomes necessary.
 - If the EMS itself becomes the ceiling (rate-limits, 429s dominate), that's
   a capacity conversation with the EMS owner, not something retries can fix
   — the circuit breaker keeps the Gateway host healthy in the meantime by
   shedding to the spool rather than hammering.
+- **Rolling out a binary fix across 80 hosts in multiple regions** is
+  itself an evolution point this design didn't have to solve when it was
+  "edit one Python file in place" — a build pipeline (CI cross-compiles
+  per `GOOS`/`GOARCH`, artifacts get pushed per region) becomes necessary
+  infrastructure, not optional polish, once a `varMap` or schema fix needs
+  to reach every host.
 
 **Signal that it's time to evolve:** sustained (not spiky) spool/DLQ growth,
 or Gateway-host load average tracking event rate rather than headroom.
@@ -312,11 +344,20 @@ fills.
 
 - **Exact Geneos env-var names** — verify against a live Gateway (this
   sandbox's network policy blocked `docs.itrsgroup.com` /
-  `support.itrsgroup.com`); confirm `VAR_MAP` in `itrs_notify.py`.
+  `support.itrsgroup.com`); confirm `varMap` in `cmd/itrs-notify/main.go`.
 - **EMS auth scheme and idempotency support** — the contract in §3c assumes
   bearer-token auth and that the EMS honors `Idempotency-Key`; confirm, or
-  add an EMS-specific adapter in `event_relay.py`.
+  add an EMS-specific adapter in `cmd/event-relay`.
 - **Multiple Gateway hosts** — confirmed one relay daemon per host; if the
   EMS needs a single, globally coordinated rate limit across hosts (rather
   than each host independently pacing itself), that's a `consistency-
   coordination` concern (shared limiter state) not addressed here.
+- **Are all 80 hosts `linux/amd64`?** The build in the README assumes it;
+  any host on a different OS/architecture (e.g. `arm64`) just needs its own
+  `GOOS`/`GOARCH` build in the same CI pipeline — confirm the fleet's
+  architecture mix before assuming one build artifact covers all 80.
+- **Binary distribution mechanism** — this design assumes *something*
+  (config management, an image build, a deploy pipeline) gets a built
+  binary onto all 80 hosts; that mechanism isn't specified here and should
+  be whatever this organization already uses to push files to the Gateway
+  fleet, not a new one invented for this.

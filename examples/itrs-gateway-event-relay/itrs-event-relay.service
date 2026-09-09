@@ -1,11 +1,13 @@
 [Unit]
-Description=ITRS Geneos -> EMS event relay (pooled HTTP delivery for itrs_notify.py)
+Description=ITRS Geneos -> EMS event relay (pooled HTTP delivery for itrs-notify)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/itrs-event-relay/event_relay.py
+# A single static binary (see README.md "Build" section) — no interpreter,
+# no venv, nothing else to install on this host.
+ExecStart=/opt/itrs-event-relay/event-relay
 Restart=always
 RestartSec=2
 
@@ -19,7 +21,7 @@ StateDirectory=itrs-event-relay
 User=itrs-relay
 Group=itrs-relay
 
-# Give shutdown time to drain the in-memory queue to disk (see event_relay.py Relay.run()).
+# Give shutdown time to drain the in-memory queue to disk (see main.go's shutdown sequence).
 TimeoutStopSec=10
 KillSignal=SIGTERM
 

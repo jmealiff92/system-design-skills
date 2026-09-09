@@ -5,35 +5,75 @@ this README is setup/ops instructions, not the design rationale.
 
 ## What's here
 
-| File | Runs as | Role |
+| Path | Builds/runs as | Role |
 |---|---|---|
-| `itrs_notify.py` | Geneos Gateway Effect (forked per trigger) | reads env vars, hands the event to the relay daemon, exits. Stdlib only. |
-| `event_relay.py` | a long-running daemon, one per Gateway host | owns the pooled HTTPS connection, retries, circuit breaker, spool/DLQ. Needs `httpx`. |
-| `itrs-event-relay.service` | — | example systemd unit for `event_relay.py`. |
+| `cmd/itrs-notify/` | Geneos Gateway Effect (forked per trigger) | reads env vars, hands the event to the relay daemon, exits. |
+| `cmd/event-relay/` | a long-running daemon, one per Gateway host | owns the pooled HTTPS connection, retries, circuit breaker, spool/DLQ. |
+| `internal/spool/`, `internal/uuid/` | shared code, compiled into both binaries | atomic spool/DLQ line format; dependency-free UUIDv4. |
+| `itrs-event-relay.service` | — | example systemd unit for `event-relay`. |
 
-## Why two programs and not one script
+Both are **single static binaries** (`CGO_ENABLED=0`) with **zero runtime
+dependencies** — nothing to `pip install`/`apt install` on any host, and
+nothing to install *at all* on the ~80 hosts `itrs-notify` runs on.
 
-Geneos forks a fresh OS process per trigger. At the target peak (60,000/min
-= 1,000/s), a script that itself opens a TLS connection to the EMS per
-invocation can't reuse connections, can't share a circuit breaker across
-invocations, and turns a single slow EMS into up to 1,000 independent,
-uncoordinated retry decisions per second. `event_relay.py` is the one
-long-running process that can hold a connection pool and coordinate that
-policy; `itrs_notify.py` stays a thin, fast, stdlib-only hand-off so the
+## Why Go, and why two programs
+
+**Two programs, not one:** Geneos forks a fresh OS process per trigger. At
+the target peak (60,000/min = 1,000/s), a script that itself opens a TLS
+connection to the EMS per invocation can't reuse connections, can't share a
+circuit breaker across invocations, and turns a single slow EMS into up to
+1,000 independent, uncoordinated retry decisions per second. `event-relay`
+is the one long-running process that can hold a connection pool and
+coordinate that policy; `itrs-notify` stays a thin, fast hand-off so the
 Gateway-visible latency of the effect never depends on the EMS's health.
-Full reasoning: design doc sections 2 and 4.
+
+**Go, not a scripting language, given ~80 Gateway hosts across regions:**
+two separate reasons stack here, and the second is the deciding one.
+- *Startup cost.* `itrs-notify` is forked up to ~1,000 times/second at peak.
+  A compiled Go binary starts in well under a millisecond — no interpreter
+  boot, no import machinery — vs. tens of milliseconds for even a bare
+  interpreter start. That's real CPU/RSS relief on the Gateway host at this
+  fork rate.
+- *Environment drift across 80 hosts in different regions.* This is the
+  bigger one. A script needs a matching, correctly-configured runtime on
+  every single host it runs on — a different base image, patch level, or
+  whoever-provisioned-it in another region is exactly the kind of drift
+  that turns into "works on 78 of 80 Gateways" at 2am. A `CGO_ENABLED=0`
+  Go build is one **static binary**: no interpreter version to match, no
+  glibc ABI to match either (that's the same drift risk landing at a lower
+  layer). Copy the same file to all 80 hosts and it behaves identically —
+  there's no "environment" left to differ.
+
+Bonus, not the deciding factor: Go's stdlib `net/http` `Transport` gives
+connection pooling/keep-alive for free, so unlike a scripting-language
+version of `event-relay`, this daemon needs zero third-party dependencies
+either — `go build` is the entire install step.
+
+The architecture (design doc sections 2–4) doesn't depend on the language;
+only the implementation does.
+
+## Build
+
+```bash
+# From this directory. Fully static — no libc/interpreter dependency on
+# the target host, and cross-compiles for every region from one machine.
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o itrs-notify ./cmd/itrs-notify
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o event-relay ./cmd/event-relay
+
+# A region running arm64 hosts: swap GOARCH=arm64 and build again — same
+# source, same binary-per-host guarantee, no toolchain needed on the host.
+```
+
+Build once in CI, distribute the two binaries to all Gateway hosts (config
+via env vars, no other files needed). `go vet ./...` and `gofmt -l .` are
+clean on this tree — wire them into CI alongside the build.
 
 ## Setup
 
-1. **Install the daemon's one dependency** (only where `event_relay.py`
-   runs — not on every Gateway host):
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. **Deploy `event_relay.py`** to each Gateway host (co-located with the
+1. **Deploy `event-relay`** to each Gateway host (co-located with the
    Gateway, so the hand-off socket is local) and run it as a service:
    ```bash
-   cp event_relay.py /opt/itrs-event-relay/
+   cp event-relay /opt/itrs-event-relay/
    cp itrs-event-relay.service /etc/systemd/system/
    mkdir -p /etc/itrs-event-relay
    printf 'ITRS_EMS_TOKEN=...\n' > /etc/itrs-event-relay/env
@@ -42,23 +82,23 @@ Full reasoning: design doc sections 2 and 4.
    systemctl daemon-reload
    systemctl enable --now itrs-event-relay
    ```
-3. **Deploy `itrs_notify.py`** anywhere Geneos can invoke it (no install
-   step — it's one stdlib file). Point a Gateway Effect at it:
-   - **Command:** `/usr/bin/python3`
-   - **Arguments:** `/opt/itrs-notify/itrs_notify.py`
+2. **Deploy `itrs-notify`** anywhere Geneos can invoke it — one file, no
+   install step. Point a Gateway Effect at it:
+   - **Command:** `/opt/itrs-notify/itrs-notify`
+   - **Arguments:** *(none needed)*
    - No extra environment configuration is required *for the hand-off* —
      Geneos already exports the trigger context as env vars, which is all
-     the script reads. Set `ITRS_RELAY_SOCK` only if the daemon's socket
+     the binary reads. Set `ITRS_RELAY_SOCK` only if the daemon's socket
      path differs from the default (`/var/run/itrs-event-relay/relay.sock`,
      matched by the systemd unit's `RuntimeDirectory=`).
-4. **Verify the real Geneos variable names before relying on severity/
+3. **Verify the real Geneos variable names before relying on severity/
    headline/etc. in the EMS.** This repo's sandbox could not reach
    `docs.itrsgroup.com` to re-verify them (see the note at the top of the
    design doc). Run one throwaway effect with `env > /tmp/env.dump` on a
-   real Gateway, compare against `VAR_MAP` in `itrs_notify.py`, and correct
-   the table if any name differs — nothing is lost either way, because
-   every `_`-prefixed variable also lands verbatim in the event's
-   `attributes` field regardless of `VAR_MAP`.
+   real Gateway, compare against `varMap` in `cmd/itrs-notify/main.go`, and
+   correct the table if any name differs — nothing is lost either way,
+   because every `_`-prefixed variable also lands verbatim in the event's
+   `attributes` field regardless of `varMap`.
 
 ## Configuration reference (env vars)
 
@@ -75,13 +115,14 @@ Full reasoning: design doc sections 2 and 4.
 | `ITRS_RELAY_MAX_RETRIES` | daemon | `1` | retries after the first attempt, before DLQ |
 | `ITRS_RELAY_BREAKER_THRESHOLD` | daemon | `20` | consecutive failures before the breaker opens |
 | `ITRS_RELAY_BREAKER_OPEN_S` | daemon | `5.0` | cooldown before a single half-open probe |
-| `ITRS_RELAY_HTTP2` | daemon | `0` | set `1` to enable HTTP/2 (needs the `h2` extra, see requirements.txt) |
-| `ITRS_NOTIFY_DEBUG` | script | *(unset)* | set `1` to log the script's own wall-time to stderr |
+| `ITRS_RELAY_HTTP2` | daemon | `0` | set `1` to enable HTTP/2 (via Go's stdlib `ForceAttemptHTTP2`, no extra dependency) |
+| `ITRS_NOTIFY_DEBUG` | `itrs-notify` | *(unset)* | set to any value to log the binary's own wall-time to stderr |
 
 ## Trying it locally (no real Gateway needed)
 
 ```bash
-pip install -r requirements.txt
+go build -o itrs-notify ./cmd/itrs-notify
+go build -o event-relay ./cmd/event-relay
 
 # terminal 1: a stand-in EMS that just 202s everything
 python3 -c "
@@ -96,14 +137,18 @@ HTTPServer(('127.0.0.1', 8940), H).serve_forever()
 # terminal 2: the relay daemon
 ITRS_EMS_URL=http://127.0.0.1:8940/api/v1/events \
 ITRS_RELAY_SOCK=/tmp/relay.sock ITRS_RELAY_SPOOL=/tmp/pending.jsonl \
-ITRS_RELAY_DLQ=/tmp/dead_letter.jsonl python3 event_relay.py
+ITRS_RELAY_DLQ=/tmp/dead_letter.jsonl ./event-relay
 
 # terminal 3: simulate a Geneos trigger
 ITRS_RELAY_SOCK=/tmp/relay.sock ITRS_NOTIFY_DEBUG=1 \
 _SEVERITY=critical _HEADLINE=CPU_Usage _MANAGED_ENTITY=host07 \
-python3 itrs_notify.py
+./itrs-notify
 ```
 
 This exact flow (plus killing the fake EMS mid-stream to exercise the
-spool/circuit-breaker/DLQ paths) is how this implementation was validated
-during development.
+spool/circuit-breaker/DLQ paths, then restarting it to confirm the breaker
+self-heals and drains the backlog) is how this implementation was
+validated during development — `go build`/`go vet`/`gofmt -l .` are clean,
+and the resilience paths (EMS-down spool fallback, breaker trip at the
+consecutive-failure threshold, automatic drain on recovery with the
+accepted/sent/DLQ counts reconciling exactly) were exercised end to end.
