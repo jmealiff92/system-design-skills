@@ -318,7 +318,8 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
   "primary_owner": "alice@corp.com", "secondary_owner": "bob@corp.com" }
 
 201 Created
-{ "order_number": "ord_88213", "status": "succeeded", "group_name": "GRP-Finance-ReadOnly" }
+{ "order_number": "ord_88213", "status": "succeeded", "group_name": "GRP-Finance-ReadOnly",
+  "ad_object_id": "a1b2c3d4-5e6f-..." }   // from the AD/directory API's create response — §5, §9
 
 200 OK   // found in our own order store, force not set — order is skipped, not an error
 { "order_number": "ord_77190", "status": "skipped", "group_name": "GRP-Finance-ReadOnly",
@@ -546,11 +547,13 @@ running server-side — `--watch` can be resumed against the same `job_id`).
 
 ### Deployment topology
 
-**"An API pod and a Postgres (or other DB) StatefulSet pod" is the right
-shape for this design's confirmed scale** — everything in §2 (≤100 writes/
-minute by construction, a handful of stateful components, no sharding
-story, §8) argues for as few moving pieces as possible, not a sprawling
-component-per-box.
+**An existing Postgres instance is available (confirmed) — use it, don't
+stand up a new StatefulSet.** Everything in §2 (≤100 writes/minute by
+construction, a handful of stateful components, no sharding story, §8)
+already argued for as few moving pieces as possible; an existing instance
+takes that further — the topology is now genuinely just the **API pod(s)**,
+with storage as a dependency this service connects to rather than one it
+operates.
 
 - **API pod(s)** — a stateless Deployment, N replicas for HA and to soak up
   read traffic (lookups, job-status polling) that isn't rate-limited at all
@@ -561,45 +564,44 @@ component-per-box.
   `SELECT ... FOR UPDATE SKIP LOCKED` is enough of a "queue" at this volume
   (`task-scheduling`'s pull-worker pattern, with Postgres as the transport
   instead of a broker).
-- **Postgres StatefulSet** — yes, and it can plausibly host **more than just
-  the order tables**, given how small every number in this design turned
-  out to be (§2):
-  - The **rate limiter** (§4/§6) can be a single row updated atomically
-    (`UPDATE ... SET tokens = tokens - 1 WHERE tokens > 0`, refilled by a
-    scheduled job or lazily on read) instead of standing up Redis — at
-    ~1.67 req/s this is well within what row-level locking on one row
-    handles without contention.
-  - The **cache** (§5, LDAP-existence and FTE results) can be a table with
-    an `expires_at` column instead of a separate cache cluster — reads
-    filter on `expires_at > now()`; a periodic job (or lazy delete-on-read)
-    reclaims expired rows. Cache hit-rate at this scale doesn't need
-    sub-millisecond Redis latency to be worth having.
-  - Even a bulk-job **upload** (§3.3) — up to ~4,500 lines at ~150B each is
-    well under 1MB — fits as a `bytea`/large-object column instead of
-    needing real object storage, if simplicity is worth more than following
-    the `blob-store` pattern literally at this size.
+- **The existing Postgres instance** — no StatefulSet, no new operational
+  surface, and its HA/backup posture is inherited for free rather than being
+  this design's problem to solve (the "who backs this up" gap a brand-new
+  StatefulSet would have opened is moot). Given how small every number in
+  this design turned out to be (§2), it can plausibly host more than just
+  the order tables:
+  - The **rate limiter** (§4/§6) as a single row updated atomically
+    (`UPDATE ... SET tokens = tokens - 1 WHERE tokens > 0`) instead of
+    standing up Redis — at ~1.67 req/s, no contention concern.
+  - The **cache** (§5, LDAP-existence and FTE results) as a table with an
+    `expires_at` column instead of a separate cache cluster.
+  - Even a bulk-job **upload** (§3.3) — ≤4,500 lines at ~150B each, well
+    under 1MB — as a `bytea`/large-object column instead of needing real
+    object storage.
 
-  Folding all of that into Postgres turns the topology into genuinely just
-  the two pods asked about — no Redis, no message broker, no S3-compatible
-  store — **at this confirmed volume.** The trade-off is coupling: a
-  Postgres outage now takes down order storage, rate limiting, caching, and
-  job dispatch together, not just writes. For a system whose own numbers
-  say "small, internal, low-stakes" (§1/§2), that coupling is a reasonable
-  price for the operational simplicity of one stateful component instead of
-  four. It stops being reasonable if any of §8's growth triggers land (a
-  real batch-create API changes the shape of things regardless; a much
-  higher rate limit or much higher read volume would start to make a
-  separate cache/rate-limiter worth splitting out again).
-- **HA for the StatefulSet itself** is the one gap a single pod leaves
-  open — not addressed by "just run it as a StatefulSet." Two reasonable,
-  equally valid paths: run it as a **managed Postgres service** (RDS/Cloud
-  SQL/equivalent) instead of self-hosting, which removes the
-  backup/failover/patching burden entirely and is usually the better
-  default when one's available; or, if it must stay in-cluster, a
-  StatefulSet **with replicas** behind a Postgres HA operator (e.g.
-  CloudNativePG, Zalando) rather than a single pod, since a single-replica
-  StatefulSet is still a SPOF for everything listed above regardless of how
-  little it's doing.
+  Two things worth confirming precisely *because* the instance is shared,
+  not dedicated to this service:
+  - **A dedicated schema** (e.g. `order_service.*`) for every table in §5
+    plus the rate-limiter/cache tables above — keeps this service's
+    migrations, naming, and row-level locking from colliding with whatever
+    else already lives on that instance.
+  - **Sign-off from whoever owns the instance** that its own capacity
+    absorbs this service's load without asking — ≤100 writes/min plus a
+    steady low-rate `SELECT ... FOR UPDATE SKIP LOCKED` poll from the bulk-
+    job dispatcher (previous bullet) is tiny in isolation, but it's still
+    new, continuous load on a resource this design doesn't own.
+
+  Folding rate-limiter/cache/upload-storage into this same instance avoids
+  adding Redis, a message broker, or an S3-compatible store — **at this
+  confirmed volume.** The trade-off is coupling: an outage on the shared
+  instance now takes down order storage, rate limiting, caching, and job
+  dispatch together, not just this service's writes — a cost every other
+  tenant of that instance already accepts, so it isn't a new risk this
+  design introduces, just one it now shares in. It stops making sense to
+  keep everything on one instance if any of §8's growth triggers land (a
+  much higher rate limit or read volume would start to make a separate
+  cache/rate-limiter worth splitting out, regardless of where the order
+  tables live).
 
 ## 5. Data model
 
@@ -616,9 +618,32 @@ otherwise: §2 puts the *entire system* at ≤100 writes/minute by construction
 job store per job in flight — trivial OLTP load for one instance, no
 sharding story needed, ever, at this design's scale (see §8).
 
+**`order_number` is generated by this system, not returned by AD** — AD has
+no concept of an "order," so there's nothing downstream to adopt. It's a
+Postgres-native, single-instance concern given §4's topology: `order_number`
+is `'ord_' || nextval(...)` off a plain sequence/identity column — no
+Snowflake ID, no UUID, no `sequencer` building block needed, because there's
+exactly one writer of record (this Postgres instance) and no cross-node
+coordination to solve. It's assigned the moment the pipeline persists the
+`orders` row (step 6, §4) — for *every* outcome (succeeded, failed,
+validation_failed, skipped), which is why even a rejected attempt is
+lookup-able (req. 5) and why `order_job_items.order_number` stays `NULL`
+until that line is actually processed, not at job-submission time.
+
+**What *does* come from downstream:** on a `succeeded` creation, the AD/
+directory provisioning API's response carries its own identifier for the
+group object it just created (e.g. an `objectGUID` in classic AD, or the
+`id` GUID Microsoft Graph returns for an Entra ID group — which one depends
+on which API variant is in play, §9). That has to be recorded, or this
+system has no durable link to the actual AD object beyond `group_name` —
+worth having independently of the name, since a rename (out of scope, §1)
+would otherwise sever the connection entirely.
+
 - **`orders`** — PK `order_number`. Columns: group_name, primary_owner,
   secondary_owner, status (`succeeded`|`validation_failed`|`failed`|
-  `skipped`), `validation_errors` (nullable array — field/code/message,
+  `skipped`), **`ad_object_id`** (nullable — the downstream identifier above;
+  populated only when status is `succeeded`, `NULL` otherwise since nothing
+  was created), `validation_errors` (nullable array — field/code/message,
   populated only when status is `validation_failed`), `error` (nullable
   object — code/message/retryable, populated only when status is `failed`),
   skipped_order_number (nullable — set when status is `skipped`, pointing at
@@ -633,9 +658,9 @@ sharding story needed, ever, at this design's scale (see §8).
     returns `skipped` pointing at the winner, rather than the app-level
     pre-check (§3.2) being trusted alone. A `failed` order does **not** hold
     the constraint, so a genuinely failed attempt (nothing was created) can
-    be retried without being treated as a duplicate — this is the default
-    dedupe rule (§9 flags it as confirmable, not a hard requirement from the
-    prompt).
+    be retried without being treated as a duplicate, and the retry may carry
+    different parameters than the failed attempt — **confirmed** intended
+    behavior (§1), not just how the constraint happens to work.
   - Unique index on `(tenant_id, idempotency_key)` for the sync path's
     retry-safety dedupe (separate from the group-name dedupe above — one is
     "don't double-execute *this* request," the other is "don't order a group
@@ -860,6 +885,11 @@ constraint (§2/§6):
 - **Exact owner-id regex** — assumed to be an email/employee-id shape (§1);
   the real pattern (and whether `primary_owner`/`secondary_owner` must be
   the same *kind* of identifier) needs the actual policy.
+- **Which directory API variant, exactly** — classic AD (LDAP,
+  `objectGUID`) vs. Microsoft Graph/Entra ID (`id`) — decides `ad_object_id`'s
+  actual shape (§5) and the concrete request/response fields in §3.3's
+  downstream calls, which are written generically ("AD/directory
+  provisioning API") pending this.
 - Auth model (API key vs. OAuth client-credentials, and how `primary_owner`/
   `secondary_owner` are authorized to receive a new group) — assumed but not
   designed; doesn't change the shapes above either way.
