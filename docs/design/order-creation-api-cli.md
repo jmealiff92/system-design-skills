@@ -6,9 +6,12 @@ A write-up structured around the reasoning loop (`system-design` skill), composi
 
 **Domain note:** an "order" here is a request to **create one Active Directory
 (AD) group** — not a physical-goods order. There is no inventory, pricing, or
-payment; the downstream dependency is an AD/directory provisioning API. Every
-order gets an **order number** the caller can look up either by that number or
-by the **group name** it was ordered for.
+payment. **This system does not call AD directly** — it submits the order to
+a **Marketplace (mktplace) order API**, which is the system responsible for
+actually provisioning the group in AD. Every order this system creates gets
+its own **order number** the caller can look up either by that number or by
+the **group name** it was ordered for; mktplace separately returns its own
+tracking id for the order it accepted (`mktplace_order_number`, §5).
 
 ## 1. Problem & scope
 
@@ -24,7 +27,7 @@ caller explicitly forces a re-order.
    `failed` / `skipped`) in one round trip — **validation happens as part of
    placing the order**, not as a separate required call. If the parameters
    don't pass, the order response itself comes back `validation_failed` with
-   the reason(s); nothing is sent downstream.
+   the reason(s); nothing is sent to mktplace.
 2. **Order a small set of groups** (e.g. 2–3) in one call, each evaluated and
    reported independently — one bad group must not block the good ones.
 3. **Order a large batch of groups** (up to **4,500** in scope; designed not
@@ -58,11 +61,13 @@ caller explicitly forces a re-order.
    number or by group name.
 
 ### Non-functional constraints
-- **Latency** — bounded by the 100/min downstream rate limit (§2), not a flat
+- **Latency** — bounded by the 100/min mktplace rate limit (§2), not a flat
   number: a single order should complete in ~1.5s p99 (one rate-limit token
-  wait + one AD call); an N-order synchronous batch (N ≤ 25) scales as
-  ≈N × 0.6s + AD latency — still one request/response, no polling, but
-  callers should expect seconds, not milliseconds, once N > 1. Bulk
+  wait + one mktplace call); an N-order synchronous batch (N ≤ 25) scales as
+  ≈N × 0.6s + mktplace latency — still one request/response, no polling, but
+  callers should expect seconds, not milliseconds, once N > 1. **This
+  latency model assumes mktplace's response to an order submission is
+  synchronous and final — see §9, this is not yet confirmed.** Bulk
   submission is *accepted* in < 2s regardless of batch size; the batch
   itself is processed asynchronously against the same shared rate limit.
 - **Throughput / batch ceiling** — up to 4,500 order lines per logical
@@ -70,7 +75,7 @@ caller explicitly forces a re-order.
   higher ceiling (see §8).
 - **Correctness under retry** — a client that retries a timed-out request (a
   single order, or a whole bulk submission) must never create the same order
-  — or the same AD group — twice.
+  — or submit the same group-creation order to mktplace — twice.
 - **No duplicate groups.** The "already ordered → skip" rule (req. 6) must
   hold under concurrent submission of the same group name (two lines in one
   bulk file, two overlapping requests) — an app-level check alone races; see
@@ -89,10 +94,11 @@ caller explicitly forces a re-order.
   (§3.2/§5) exists specifically to bound this, not just to shave latency.
 
 ### Out of scope (explicitly)
-- The AD/directory provisioning engine itself (the actual LDAP/Graph-API
-  calls that create the group object and set its `primary_owner`/
-  `secondary_owner`) — treated as an existing downstream service this API
-  calls.
+- **The Marketplace's own order-fulfillment process** — however mktplace
+  actually provisions the group in AD (its own LDAP/Graph-API calls,
+  retries, internal queueing) is entirely mktplace's concern; this design
+  only decides how it submits an order to mktplace and interprets the
+  response (§3.3, §9).
 - Group **lifecycle after creation** — membership changes, renaming,
   deletion, ownership transfer. This design only covers *ordering the
   creation*.
@@ -101,9 +107,10 @@ caller explicitly forces a re-order.
   design *detects* that case at validation time (in scope, unlike the
   earlier draft), but backfilling an order record for it, or any broader
   drift audit/sync, is not designed here. Flagged in §9.
-- The **LDAP existence-check and active-FTE-check APIs themselves** — their
-  own availability, latency, and rate limits are assumed, not designed
-  (§9); this design only decides how it calls and caches them.
+- **The mktplace order API, LDAP existence-check API, and active-FTE-check
+  API themselves** — their own availability, latency, and rate limits are
+  assumed, not designed (§9); this design only decides how it calls and
+  caches them.
 - Auth/authz model for who may order which groups — assumed to exist (API
   key / SSO), not designed here.
 - Multi-region/multi-tenant data residency — assumed single-region/single-
@@ -117,10 +124,14 @@ caller explicitly forces a re-order.
   name, not a separate client-supplied id.
 - Callers are trusted server-to-server integrations (internal tools, service
   catalogs, or the CLI) — not untrusted public browser clients.
-- **The AD provisioning system enforces a hard rate limit of 100 requests/
-  minute** (confirmed — see §2/§6), shared across every caller of this API,
-  not per-tenant. This is the dominant constraint on the whole design, more
-  than storage or compute.
+- **Marketplace (mktplace) enforces a hard rate limit of 100 requests/
+  minute** (confirmed — see §2/§6) on order submissions, shared across every
+  caller of this API, not per-tenant. This is the dominant constraint on the
+  whole design, more than storage or compute.
+- **This system submits an order to mktplace; it never calls AD or LDAP to
+  create anything.** mktplace is a distinct system from the LDAP
+  existence-check and FTE-check APIs (below) — three separate downstream
+  dependencies in total, not one.
 - Average order line (`group_name`, `primary_owner`, `secondary_owner`) is
   ~150 bytes as JSON.
 - **`primary_owner` and `secondary_owner` must be different AD principals**
@@ -142,8 +153,16 @@ caller explicitly forces a re-order.
   design treats a `false`/not-found response as a blocking validation
   failure, not a warning.
 - The LDAP existence-check and FTE-check APIs are **separate systems** from
-  the AD provisioning (group-create) API, with their own latency/rate limits
-  — **not** assumed to share the 100/min budget (§2). Worth confirming (§9).
+  mktplace (the order-submission API), with their own latency/rate limits —
+  **not** assumed to share the 100/min budget (§2). Worth confirming (§9).
+- **Mktplace's response to an order submission is assumed synchronous and
+  final** — i.e. by the time it responds, the group either exists in AD or
+  the order definitively failed, with no further state change to wait for.
+  This is the single most load-bearing unconfirmed assumption in this
+  design (§9) — if mktplace is itself asynchronous (accepts the order,
+  resolves it later), the latency model (above) and the pipeline (§4) both
+  need to change to poll or accept a callback rather than trusting the
+  submission response as final.
 - **Owner reuse across a bulk job is high** — the same handful of managers/
   teams order most groups in a given submission, so the distinct-owner count
   in a 4,500-line job is assumed to be a small fraction of 9,000 (2 owners ×
@@ -157,12 +176,12 @@ caller explicitly forces a re-order.
 | Orders per submission | 1 – 4,500 | stated requirement |
 | Order line size (JSON) | ~150 B | `group_name` + `primary_owner` + `secondary_owner` |
 | 4,500-order payload, inline | ~0.7 MB | 4,500 × 150 B |
-| Downstream calls per order | 1 (create-group, owners set at creation) | pipeline in §3 |
-| Downstream call latency | p50 150 ms / p99 400 ms | assumed AD/Graph API SLA |
-| **AD-provisioning rate limit** | **100 requests/minute, system-wide** (confirmed, not per-tenant) | stated constraint — this API must self-throttle to it, not just retry on 429 |
+| Downstream calls per order | 1 (submit order to mktplace, owners included) | pipeline in §3 |
+| Mktplace order-submission latency | p50 150 ms / p99 400 ms | assumed SLA — **confirm** |
+| **Mktplace order-submission rate limit** | **100 requests/minute, system-wide** (confirmed, not per-tenant) | stated constraint — this API must self-throttle to it, not just retry on 429 |
 | Effective downstream throughput | ~1.67 req/s | 100 ÷ 60 |
-| Time for 1 order (steady state) | ~0.6 s wait for a token + ~150–400 ms AD call | rate limit, not AD latency, now dominates even a single order |
-| Time for a 3-order small batch | **~2–3 s** | ≈3 sequential token waits (~0.6s apart) + AD latency each |
+| Time for 1 order (steady state) | ~0.6 s wait for a token + ~150–400 ms mktplace call | rate limit, not mktplace latency, now dominates even a single order |
+| Time for a 3-order small batch | **~2–3 s** | ≈3 sequential token waits (~0.6s apart) + mktplace latency each |
 | Time for a 4,500-order bulk job | **~45 minutes** | 4,500 ÷ 100 per min — this is the number that matters, not a compute estimate |
 | Concurrent bulk jobs worth planning for | 1–2 | the 100/min budget is shared system-wide; more concurrent jobs don't finish faster, they just interleave against the same ceiling |
 | In-flight line items, worst case | ~4,500–9,000 | one or two max-size jobs in flight at once |
@@ -181,20 +200,21 @@ assuming either can absorb 9,000 calls per bulk job without being asked to.
   workers just queue up against the same 100/min ceiling. The design need is
   a **single, shared, accurately-enforced rate limiter** (one token bucket,
   not "N workers each self-limiting," which would either double-count the
-  budget or under-use it) gating every call this API makes downstream (→
-  `resilience-failure`).
+  budget or under-use it) gating every order this API submits to mktplace
+  (→ `resilience-failure`).
 - **A small batch is no longer "fast."** 3 sequential orders spaced ~0.6s
   apart by the rate limit alone take 2–3s — real, but still one request/
   response, no polling needed. The latency NFR below is restated per-item
-  rather than as a single flat p99 (see NFR).
+  rather than as a single flat p99 (see NFR) — and depends entirely on
+  mktplace's response being final (§9).
 - **Sync calls must not queue behind a bulk job**, or a single order could
   wait up to 45 minutes for a token consumed by someone else's big batch.
   This makes the priority lane in §4 a **reserved slice of the 100/min
   budget**, not just dispatch ordering (see §6).
 - The payload/storage numbers above are small enough that neither inline-vs-
   upload ingestion (§3) nor the order store (§5) is a scaling concern at this
-  volume — the rate limit is the only real bottleneck for AD-provisioning
-  calls specifically.
+  volume — the rate limit is the only real bottleneck for mktplace
+  submissions specifically.
 - **The validation-side calls (LDAP existence, FTE) need their own
   bottleneck story, separate from the 100/min limit** — nothing says those
   APIs tolerate 9,000 calls per bulk job. Caching (§3.2/§5) is the mitigation
@@ -225,10 +245,10 @@ Every line — single order, batch line, or bulk-file row — is the same shape:
 Just the three business fields plus the `force` control flag — no
 `group_type`, `description`, `parent_ou`, or `members`: with a single target
 domain (§1) and a fixed system-wide placement/type policy, there's nothing
-else for the caller to specify. Both owners are validated and set on the AD
-group at creation (§3.2/§4); which becomes the group's primary `managedBy`
-vs. a secondary owner is an AD-provisioning-API detail, not something this
-API's contract needs to expose beyond the two fields above.
+else for the caller to specify. Both owners are included in the order
+submitted to mktplace (§3.2/§4); how mktplace maps them onto the AD group's
+`managedBy` vs. a secondary owner is mktplace's own detail, not something
+this API's contract needs to expose beyond the two fields above.
 
 ### 3.2 Validation — runs on every order; also callable standalone
 
@@ -299,10 +319,10 @@ implementation** — "it validated" and "it orders" can't drift apart.
 The `availability` check here is **advisory**: it reflects a point-in-time
 read (possibly cached) of our order store and LDAP. The authoritative check
 is the one the create path performs — the DB's unique constraint for
-`already_ordered` (§5), and the AD create call itself for `exists_in_ad`
-(§3.3's `force=true` note) — a dry run showing `not_found` can still lose a
-race, which is why the actual order response is what a caller must trust for
-the final outcome.
+`already_ordered` (§5), and mktplace's own order processing for
+`exists_in_ad` (§3.3's `force=true` note) — a dry run showing `not_found`
+can still lose a race, which is why the actual order response is what a
+caller must trust for the final outcome.
 
 Bulk dry-run: `POST /v1/order-jobs?mode=validate_only` (see 3.3) — same
 ingestion shape, no orders are created, results carry per-line `checks`.
@@ -319,7 +339,7 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
 
 201 Created
 { "order_number": "ord_88213", "status": "succeeded", "group_name": "GRP-Finance-ReadOnly",
-  "ad_object_id": "a1b2c3d4-5e6f-..." }   // from the AD/directory API's create response — §5, §9
+  "mktplace_order_number": "MKT-2026-771102" }   // mktplace's own tracking id — §5, §9
 
 200 OK   // found in our own order store, force not set — order is skipped, not an error
 { "order_number": "ord_77190", "status": "skipped", "group_name": "GRP-Finance-ReadOnly",
@@ -329,7 +349,7 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
 { "order_number": "ord_88219", "status": "skipped", "group_name": "GRP-Legacy-Ops",
   "reason": "exists_in_ad" }   // no existing_order_number — nothing here ordered it (§9)
 
-422 Unprocessable Entity   // step 1 of the pipeline (§4) — no AD call, no FTE-check call was made
+422 Unprocessable Entity   // step 1 of the pipeline (§4) — no mktplace call, no FTE-check call was made
 { "order_number": "ord_88214", "status": "validation_failed", "group_name": "GRP-Ops-!!invalid",
   "reason": [
     { "field": "group_name", "code": "invalid_group_name",
@@ -338,31 +358,31 @@ Idempotency-Key: 3f9a2e7c-...        # required, one per logical order
       "message": "bob@corp.com is not an active full-time employee." }
   ] }
 
-502 Bad Gateway   // input was valid, the group wasn't a duplicate — the downstream AD call itself failed
+502 Bad Gateway   // input was valid, the group wasn't a duplicate — the mktplace order-submission call itself failed
 { "order_number": "ord_88215", "status": "failed", "group_name": "GRP-Finance-ReadOnly",
-  "error": { "code": "ad_provisioning_timeout", "message": "Directory service did not respond in time.",
+  "error": { "code": "mktplace_order_timeout", "message": "Marketplace did not respond in time.",
              "request_id": "req_...", "retryable": true } }
 ```
 
 Every response — succeeded, validation_failed, skipped, or failed — carries
 an `order_number`: even a rejected attempt is a recorded, lookup-able order
 (req. 5). `validation_failed` (client's input, fixable, no downstream call
-made, not retryable as-is) and `failed` (our/AD's execution error, often
-retryable) are kept as **distinct statuses** on purpose — a caller scripting
-against this API can tell "fix your request" apart from "safe to retry"
-without parsing the error code. `orders` accepts a top-level array for a
-small batch:
+made, not retryable as-is) and `failed` (mktplace's/our execution error,
+often retryable) are kept as **distinct statuses** on purpose — a caller
+scripting against this API can tell "fix your request" apart from "safe to
+retry" without parsing the error code. `orders` accepts a top-level array
+for a small batch:
 `POST /v1/orders { "orders": [ {...}, {...}, {...} ] }` → `207 Multi-Status`
 with one result per input order, same shape as above, in input order. Capped
 at 25 so the call stays synchronous and bounded; above that, use the bulk job
 endpoint below (the CLI makes this cutover automatic — see 3.5).
 
-**`force=true`** bypasses the duplicate skip for that line and orders a new
-group-creation attempt regardless of order history. It does **not** bypass
-AD's own uniqueness: if the group genuinely still exists in AD, the
-downstream create call itself rejects it and the order comes back `failed`
-with `code: "group_already_exists_in_ad"` — `force` re-attempts, it never
-fabricates a group AD would refuse to create.
+**`force=true`** bypasses the duplicate skip for that line and submits a new
+group-creation order to mktplace regardless of our own order history. It
+does **not** bypass mktplace's own duplicate detection: if the group
+genuinely still exists in AD, mktplace's own order processing rejects it and
+the order comes back `failed` with `code: "group_already_exists"` — `force`
+re-attempts, it never fabricates a group mktplace would refuse to create.
 
 **Bulk (async, up to the documented ceiling — 4,500 in scope today):**
 
@@ -399,12 +419,13 @@ GET /v1/order-jobs/{job_id}
 GET /v1/order-jobs/{job_id}/results?limit=200&cursor=eyJ...
 200 OK
 { "data": [
-    { "line": 1, "group_name": "GRP-Finance-ReadOnly", "status": "succeeded", "order_number": "ord_88213" },
+    { "line": 1, "group_name": "GRP-Finance-ReadOnly", "status": "succeeded", "order_number": "ord_88213",
+      "mktplace_order_number": "MKT-2026-771102" },
     { "line": 2, "group_name": "GRP-Sales-All",         "status": "skipped",  "order_number": "ord_77190", "reason": "already_ordered" },
     { "line": 3, "group_name": "GRP-Ops-!!invalid",     "status": "validation_failed", "order_number": "ord_88220",
       "reason": [ { "field": "group_name", "code": "invalid_group_name", "message": "..." } ] },
     { "line": 4, "group_name": "GRP-HR-All",            "status": "failed", "order_number": "ord_88221",
-      "error": { "code": "ad_provisioning_timeout", "retryable": true, "...": "..." } }
+      "error": { "code": "mktplace_order_timeout", "retryable": true, "...": "..." } }
   ],
   "next_cursor": "eyJ...", "has_more": true }
 
@@ -479,11 +500,12 @@ running server-side — `--watch` can be resumed against the same `job_id`).
                                          │  3. FTE check: primary_owner,
                                          │     secondary_owner (cache-backed)
                                          │     → validation_failed if either
-                                         │     check (1/3) fails — no AD
-                                         │     call, no token spent
+                                         │     check (1/3) fails — no
+                                         │     mktplace call, no token spent
                                          │  4. acquire a token from the
                                          │     shared 100/min rate limiter
-                                         │  5. AD group-create (owners set)
+                                         │  5. submit order to mktplace
+                                         │     (owners included)
                                          │     → failed on downstream error
                                          │  6. persist order (succeeded/
                                          │     validation_failed/failed/skipped)
@@ -500,11 +522,18 @@ running server-side — `--watch` can be resumed against the same `job_id`).
                                              │           │ (on miss)
                                              ▼           ▼
                           ┌────────────────────┐ ┌────────────────────────────┐
-                          │ AD / directory       │ │ LDAP existence-check API /  │
-                          │ provisioning API      │ │ Active-FTE-check API        │
+                          │ Marketplace          │ │ LDAP existence-check API /  │
+                          │ (mktplace) order API  │ │ Active-FTE-check API        │
                           │ (out of scope, §1)    │ │ (out of scope, §1)          │
                           └────────────────────┘ └────────────────────────────┘
 ```
+
+Three distinct downstream dependencies, not one — worth keeping straight
+since they're easy to conflate: **mktplace** (submits the order; the only
+one that's rate-limited at 100/min; out of scope §1), the **LDAP existence-
+check API** (read-only, "does this group already exist," §3.2), and the
+**FTE-check API** (read-only, "is this owner active," §3.2). This system
+never talks to AD or LDAP-for-writes directly — only mktplace does that.
 
 - **API gateway** — authn/authz, rate limiting per caller (protects the
   service from a runaway CLI script), routes sync vs. job intake.
@@ -519,8 +548,8 @@ running server-side — `--watch` can be resumed against the same `job_id`).
   "it validated" can never go stale by the time the order is actually
   placed. Steps ordered cheapest-and-most-decisive first: local regex, then
   availability (which can end the request in a `skipped` before any owner
-  gets checked), then the FTE calls, then the scarce rate-limited AD call
-  last of all — nothing expensive runs for a request that's going to be
+  gets checked), then the FTE calls, then the scarce rate-limited mktplace
+  call last of all — nothing expensive runs for a request that's going to be
   rejected or skipped anyway.
 - **Line-item queue** has (at least) two lanes/priorities — sync-path calls
   don't sit behind a 4,500-line job (§2's fairness requirement) — a
@@ -534,12 +563,12 @@ running server-side — `--watch` can be resumed against the same `job_id`).
   physical* component (Redis) or a table in the same Postgres instance is a
   deployment-topology choice, not a design one; see below.
 - **Shared rate limiter** is the component §2's numbers actually demand: one
-  token bucket, refilled at 100/min, that every downstream AD call (sync or
-  bulk) acquires a token from before dispatch — not per-worker limiting,
-  which would either over- or under-count the real budget. A small slice of
-  the bucket is reserved for the sync lane (§6) so a big bulk job can't starve
-  single-order latency. Physically, this can live in Postgres too at this
-  volume — see Deployment topology below.
+  token bucket, refilled at 100/min, that every mktplace order submission
+  (sync or bulk) acquires a token from before dispatch — not per-worker
+  limiting, which would either over- or under-count the real budget. A small
+  slice of the bucket is reserved for the sync lane (§6) so a big bulk job
+  can't starve single-order latency. Physically, this can live in Postgres
+  too at this volume — see Deployment topology below.
 - **Blob store** exists only for the upload path (>500 lines) — a
   `blob-store` building block, not a bespoke file service.
 - **Order store** is a single relational database (PostgreSQL or equivalent)
@@ -557,13 +586,13 @@ operates.
 
 - **API pod(s)** — a stateless Deployment, N replicas for HA and to soak up
   read traffic (lookups, job-status polling) that isn't rate-limited at all
-  (only the AD-create call is, §2). This same image is also where bulk-job
-  dispatch runs: given the confirmed ceiling (~1.67 req/s), it doesn't need
-  a separate worker deployment — one of the replicas (or all of them,
-  coordinating via the DB) polling `order_job_items` for pending rows using
-  `SELECT ... FOR UPDATE SKIP LOCKED` is enough of a "queue" at this volume
-  (`task-scheduling`'s pull-worker pattern, with Postgres as the transport
-  instead of a broker).
+  (only the mktplace order-submission call is, §2). This same image is also
+  where bulk-job dispatch runs: given the confirmed ceiling (~1.67 req/s),
+  it doesn't need a separate worker deployment — one of the replicas (or all
+  of them, coordinating via the DB) polling `order_job_items` for pending
+  rows using `SELECT ... FOR UPDATE SKIP LOCKED` is enough of a "queue" at
+  this volume (`task-scheduling`'s pull-worker pattern, with Postgres as the
+  transport instead of a broker).
 - **The existing Postgres instance** — no StatefulSet, no new operational
   surface, and its HA/backup posture is inherited for free rather than being
   this design's problem to solve (the "who backs this up" gap a brand-new
@@ -618,37 +647,42 @@ otherwise: §2 puts the *entire system* at ≤100 writes/minute by construction
 job store per job in flight — trivial OLTP load for one instance, no
 sharding story needed, ever, at this design's scale (see §8).
 
-**`order_number` is generated by this system, not returned by AD** — AD has
-no concept of an "order," so there's nothing downstream to adopt. It's a
-Postgres-native, single-instance concern given §4's topology: `order_number`
-is `'ord_' || nextval(...)` off a plain sequence/identity column — no
-Snowflake ID, no UUID, no `sequencer` building block needed, because there's
-exactly one writer of record (this Postgres instance) and no cross-node
-coordination to solve. It's assigned the moment the pipeline persists the
-`orders` row (step 6, §4) — for *every* outcome (succeeded, failed,
-validation_failed, skipped), which is why even a rejected attempt is
+**`order_number` is generated by this system, not returned by mktplace** —
+it's a Postgres-native, single-instance concern given §4's topology:
+`order_number` is `'ord_' || nextval(...)` off a plain sequence/identity
+column — no Snowflake ID, no UUID, no `sequencer` building block needed,
+because there's exactly one writer of record (this Postgres instance) and no
+cross-node coordination to solve. It's assigned the moment the pipeline
+persists the `orders` row (step 6, §4) — for *every* outcome (succeeded,
+failed, validation_failed, skipped), which is why even a rejected attempt is
 lookup-able (req. 5) and why `order_job_items.order_number` stays `NULL`
 until that line is actually processed, not at job-submission time.
 
-**What *does* come from downstream:** on a `succeeded` creation, the AD/
-directory provisioning API's response carries its own identifier for the
-group object it just created (e.g. an `objectGUID` in classic AD, or the
-`id` GUID Microsoft Graph returns for an Entra ID group — which one depends
-on which API variant is in play, §9). That has to be recorded, or this
-system has no durable link to the actual AD object beyond `group_name` —
-worth having independently of the name, since a rename (out of scope, §1)
-would otherwise sever the connection entirely.
+**What *does* come from downstream:** on a `succeeded` order, mktplace's
+response carries **its own tracking identifier for the order it accepted** —
+`mktplace_order_number` — not a raw AD object id, since this system never
+sees AD's own identifiers at all (mktplace is the only thing that talks to
+AD, §1/§4). This has to be recorded, or this system has no reference back
+into mktplace's own order history for that group beyond `group_name` — worth
+having independently of the name, since a rename (out of scope, §1) would
+otherwise sever the connection entirely. **What `mktplace_order_number`
+actually proves is still an open question (§9):** if mktplace's acceptance
+is synchronous-final (the assumed default, §1), it means the AD group now
+exists; if mktplace is itself asynchronous, it only means mktplace *accepted
+the order*, and this design would need a follow-up mechanism (poll
+mktplace by its order number, or a callback) to learn the real outcome
+rather than trusting `succeeded` as written here.
 
 - **`orders`** — PK `order_number`. Columns: group_name, primary_owner,
   secondary_owner, status (`succeeded`|`validation_failed`|`failed`|
-  `skipped`), **`ad_object_id`** (nullable — the downstream identifier above;
-  populated only when status is `succeeded`, `NULL` otherwise since nothing
-  was created), `validation_errors` (nullable array — field/code/message,
-  populated only when status is `validation_failed`), `error` (nullable
-  object — code/message/retryable, populated only when status is `failed`),
-  skipped_order_number (nullable — set when status is `skipped`, pointing at
-  the order it deferred to), `job_id` (nullable — set when ordered via a bulk
-  job), created_at.
+  `skipped`), **`mktplace_order_number`** (nullable — mktplace's own
+  tracking id, populated only when status is `succeeded`, `NULL` otherwise
+  since no order was accepted), `validation_errors` (nullable array —
+  field/code/message, populated only when status is `validation_failed`),
+  `error` (nullable object — code/message/retryable, populated only when
+  status is `failed`), skipped_order_number (nullable — set when status is
+  `skipped`, pointing at the order it deferred to), `job_id` (nullable — set
+  when ordered via a bulk job), created_at.
   - **Unique index on `group_name` for rows where `status IN ('succeeded',
     'pending', 'processing')`** (a partial/filtered unique index — single
     domain, so no qualifier beyond the name itself, §1) — this is what makes
@@ -675,11 +709,11 @@ would otherwise sever the connection entirely.
   idempotent per line: on reprocessing, a line whose `group_name` already has
   a `succeeded` (or `skipped`) row is returned as-is, not re-run — but one
   that's `validation_failed` *is* re-run on reprocessing (the input didn't
-  change, but re-validating is cheap and correct, unlike re-calling AD).
-  Columns: status (`succeeded`|`validation_failed`|`failed`|`skipped`),
-  order_number (nullable), validation_errors (nullable), error (nullable),
-  attempt_count. `GET .../results` pages on `(job_id, line_index)` — a
-  stable, monotonic cursor key.
+  change, but re-validating is cheap and correct, unlike re-submitting to
+  mktplace). Columns: status (`succeeded`|`validation_failed`|`failed`|
+  `skipped`), order_number (nullable), validation_errors (nullable), error
+  (nullable), attempt_count. `GET .../results` pages on
+  `(job_id, line_index)` — a stable, monotonic cursor key.
 - **`idempotency_keys`** (sync path) — `(tenant_id, idempotency_key)` →
   stored response, TTL 24h, per the standard `api-design` idempotency
   state-machine (pending/complete, reject on same-key-different-body).
@@ -688,23 +722,23 @@ would otherwise sever the connection entirely.
 physically lives (a separate Redis, or a table in this same Postgres
 instance — a deployment-topology choice, not a design one; see §4's
 Deployment topology). Two namespaces, both cache-aside with a TTL (neither
-upstream
-system offers invalidation events, so TTL expiry is the only eviction
-mechanism):
+upstream system offers invalidation events, so TTL expiry is the only
+eviction mechanism):
 - `fte:{owner_id} → active|inactive`, **TTL 15 minutes (confirmed).** Long
   enough that a 4,500-line job's owner reuse (§2) collapses to ~50–200
   calls; the staleness this trades for — a cached `active` for someone
   terminated moments ago approving an owner the live API would now reject —
-  is a **genuine risk, not a self-correcting one** (AD itself doesn't care
+  is a **genuine risk, not a self-correcting one** (mktplace/AD doesn't care
   who the owner is), but the 15-minute window has been confirmed acceptable
   for this system.
 - `ldap_exists:{group_name} → found|not_found`, **TTL ~60 seconds.** Short —
   its only real job is avoiding a duplicate LDAP round trip between a
   validate-then-order pair for the same line (§3.2), not surviving across a
   whole bulk job. Staleness here is **self-correcting**: a stale `not_found`
-  just means the AD create call itself rejects the group as already
+  just means mktplace's own order processing rejects the group as already
   existing (§3.3) — worse UX (`failed` instead of a clean `skipped`), not a
-  correctness bug, because AD's own uniqueness is still the backstop.
+  correctness bug, because mktplace's own duplicate detection is still the
+  backstop.
 
 Group-name lookup (`GET /v1/orders?group_name=...`, req. 5) is served by the
 `group_name` index above — the same index that enforces the duplicate-skip
@@ -726,18 +760,18 @@ every access pattern here is job-scoped.
 | `validation_failed` and `failed` as distinct order statuses | A caller can branch on "fix the request" vs "safe to retry" without parsing error codes (req. 1/5) | One more status value in every enum/consumer (job counts, CLI filters, data model) | Never — this is exactly the distinction the requirement asks for |
 | LDAP existence check added to validation (not just our own order store) | Closes the "group created outside this process" gap — previously out of scope, now actually detected (§1) | A second external dependency validation now waits on, alongside the FTE check | Never — this is the fix for exactly that gap |
 | Cache both the LDAP existence check and the FTE check, cache-aside with TTL | Cuts ~9,000 potential calls/4,500-order job to a few hundred for FTE (owner reuse, §2), and avoids a duplicate LDAP call on validate-then-order for the same line | Two staleness windows to reason about — bounded but real for FTE (§5), self-correcting for LDAP (§5) | The FTE TTL's staleness risk becomes unacceptable to the business → shorten it or drop caching for that check specifically, not both |
-| Validation steps ordered cheapest/most-decisive first (regex → availability → FTE → rate-limited AD call) | A request that's going to be skipped or rejected never spends an FTE-check call or a scarce rate-limit token on itself | The pipeline has more sequential stages, and their order is now a meaningful design choice, not incidental | Never — reordering would spend the scarcest resources (rate-limit tokens, and calls to APIs whose own limits are unstated, §9) on doomed requests |
+| Validation steps ordered cheapest/most-decisive first (regex → availability → FTE → rate-limited mktplace call) | A request that's going to be skipped or rejected never spends an FTE-check call or a scarce rate-limit token on itself | The pipeline has more sequential stages, and their order is now a meaningful design choice, not incidental | Never — reordering would spend the scarcest resources (rate-limit tokens, and calls to APIs whose own limits are unstated, §9) on doomed requests |
 | Sync endpoint (≤25) + separate async job endpoint (up to 4,500+) | Keeps single-order latency low; lets bulk scale independently | Two code paths to keep behaviorally identical (mitigated: both call the same order pipeline, §4) | The sync cutover (25) is wrong for real traffic → tune, don't redesign |
 | `group_name` as the dedupe/business key (no separate `external_id`) | One fewer field to require from callers; "look up by group name" and "already ordered" share one index (§5) | Renaming a group later has no clean story here (out of scope, §1) — the key is fixed at order time | A second domain is ever added → key must become `(domain, group_name)`, since §1 confirms single-domain today |
-| A single shared rate limiter (one 100/min token bucket), not per-worker limiting | Correctly enforces the real, confirmed constraint (§2) regardless of worker-pool size — adding workers can't accidentally over-spend the budget | Every call path (sync and bulk) now depends on one shared piece of state — it must be fast and available, or nothing can place an order (→ §7) | Never, while the limit is a single system-wide number; if AD ever exposes per-tenant quotas, the bucket becomes per-tenant |
+| A single shared rate limiter (one 100/min token bucket), not per-worker limiting | Correctly enforces the real, confirmed constraint (§2) regardless of worker-pool size — adding workers can't accidentally over-spend the budget | Every call path (sync and bulk) now depends on one shared piece of state — it must be fast and available, or nothing can place an order (→ §7) | Never, while the limit is a single system-wide number; if mktplace ever exposes per-tenant quotas, the bucket becomes per-tenant |
 | A reserved slice of the 100/min budget for the sync lane (not just dispatch-order priority) | A big bulk job literally cannot starve single-order latency down to zero, even under the confirmed low ceiling (§2) | Reserved sync capacity is bulk capacity not spent — a max bulk job takes a little longer than the raw 45 min math (§2) | The real traffic mix shows sync calls are rare enough that a reservation wastes bulk throughput → shrink or drop it |
 | PostgreSQL (single relational instance) for the order store, not NoSQL | Atomic unique constraints are what make the group-name and idempotency-key dedupe (§5) correct under concurrency; the confirmed 100/min limit keeps volume trivial for one instance | A single writer to keep available (standard HA replica, not a novel problem here) | Never, at this design's scale (§8) — revisit only if `data-storage` scale numbers actually demand a distributed store |
 | Skip-by-default on duplicate, `force=true` to override; a `failed` order never blocks a retry (confirmed — §1) | Prevents accidental re-ordering of an existing/in-flight group; a failed attempt can be freely resubmitted, including with different owners, with no `force` needed (req. 5/6) | A retry after `failed` must use a new `Idempotency-Key` (§1) — reusing the old one with different owners is a key-reuse conflict, not a silent success | Never, as confirmed — only if "already ordered" is later redefined to include failed attempts would the unique-index predicate need to widen |
 | Duplicate check enforced by a **DB unique constraint**, not just the app-level `orders:validate` pre-check | Correct under concurrency — two racing submissions for the same group can't both succeed | The loser of the race gets its `skipped` result at insert time, not at validate time — slightly less "predictable" from the client's view | Never — this is the correctness backstop; relaxing it reopens the duplicate-group race |
-| `force=true` still goes through the real AD create call (not a bypass of AD's own uniqueness) | A forced re-order of a group AD still has fails cleanly with a clear error, never silently duplicates | `force` looks like it "always creates" but sometimes still fails — needs documenting | Never — bypassing AD's own check would let this API create actual duplicate directory objects |
+| `force=true` still goes through the real mktplace order call (not a bypass of mktplace's own duplicate detection) | A forced re-order of a group that still genuinely exists fails cleanly with a clear error, never silently duplicates | `force` looks like it "always creates" but sometimes still fails — needs documenting | Never — bypassing mktplace's own check would let this API submit orders for actual duplicate directory objects |
 | Inline body (≤500 lines) *or* presigned-upload for bulk | Never hits a gateway payload ceiling as batch size grows | Two ingestion paths in the client/CLI to implement | Gateway payload limits change → could raise the inline threshold instead |
 | Idempotency-Key per order **and** per job, `group_name` per line | Safe retries at every granularity (single call, whole job, one line within a resumed job) | Two idempotency scopes plus the business-key dedupe to reason about | Never — this is what makes retries at any level safe |
-| Worker-pool size decoupled from throughput (concurrency just hides non-AD-call latency: validation, duplicate check, persist) | No wasted complexity sizing a large pool the rate limiter would throttle anyway | A 4,500-order job still takes ~45 min regardless of pool size (§2) — that's the confirmed limit, not a tuning knob | AD offers a real batch-create API → call that instead of N single calls, which is the only lever that actually changes completion time (§8) |
+| Worker-pool size decoupled from throughput (concurrency just hides non-mktplace-call latency: validation, duplicate check, persist) | No wasted complexity sizing a large pool the rate limiter would throttle anyway | A 4,500-order job still takes ~45 min regardless of pool size (§2) — that's the confirmed limit, not a tuning knob | Mktplace offers a real batch-order API → call that instead of N single submissions, which is the only lever that actually changes completion time (§8) |
 | Priority lanes for sync vs. bulk line-item dispatch | A 4,500-line job can't starve single-order latency | Scheduler has to be lane-aware, not a plain FIFO queue | Traffic mix makes this moot (e.g. bulk becomes the only path) |
 
 ## 7. Failure modes & degradation
@@ -749,15 +783,15 @@ every access pattern here is job-scoped.
   came back negative, which is why it's `validation_failed` (fixable,
   non-retryable) and not `failed` — the distinction only holds because the
   check actually completed. Returns the specific field/code/message
-  immediately — no AD call, no rate-limit token spent either way.
+  immediately — no mktplace call, no rate-limit token spent either way.
 - **The FTE-check or LDAP existence-check API errors outright** (times out,
   5xx — as opposed to a definitive "not active" / "exists" answer) — this is
   **not** the same as a validation failure, because the check never actually
   ran to completion: the order comes back `failed` with `retryable: true`,
-  same treatment as an AD provisioning error (`resilience-failure`: timeout +
-  circuit breaker per dependency). Conflating "the check said no" with "the
-  check couldn't run" would misclassify a transient outage as the caller's
-  fault.
+  same treatment as a mktplace order-submission error (`resilience-failure`:
+  timeout + circuit breaker per dependency). Conflating "the check said no"
+  with "the check couldn't run" would misclassify a transient outage as the
+  caller's fault.
 - **The cache is unavailable** — fail **open**, not closed: the pipeline
   calls the LDAP/FTE APIs directly rather than blocking orders on a cache
   outage, since the cache is a load-reduction optimization (§5/§6), not a
@@ -769,19 +803,20 @@ every access pattern here is job-scoped.
   through, sync or bulk (§6). Fail closed: orders return a `retryable: true`
   5xx rather than bypassing the limiter and risking a burst past the
   confirmed 100/min ceiling. Run it as a small, highly-available component
-  (e.g. a replicated in-memory store) rather than folding it into the order
-  DB, so an order-store blip and a rate-limiter blip aren't the same failure.
+  (e.g. a replicated in-memory store, or a row in the shared Postgres
+  instance, §4) rather than folding it into order-processing logic, so an
+  order-store blip and a rate-limiter blip aren't the same failure.
 - **The sync lane's reserved token slice is exhausted** (a burst of small
   batches) — `429` + `Retry-After`, same contract as any other rate limit
   (`api-design`); the caller backs off and retries, it does not silently
   fall back to consuming bulk-reserved tokens.
-- **AD provisioning API slow or down** — each call is wrapped in a timeout +
-  circuit breaker (`resilience-failure`). Sync path: the order fails fast
-  with a `retryable: true` 5xx rather than hanging. Bulk path: the breaker
-  trips, dispatch of *new* lines from that job pauses and backs off with
-  jitter; already-succeeded/skipped lines stand; job status surfaces as
-  `processing` with a `degraded` flag rather than silently stalling. No line
-  is retried past its own attempt-count budget.
+- **Mktplace's order API is slow or down** — each call is wrapped in a
+  timeout + circuit breaker (`resilience-failure`). Sync path: the order
+  fails fast with a `retryable: true` 5xx rather than hanging. Bulk path:
+  the breaker trips, dispatch of *new* lines from that job pauses and backs
+  off with jitter; already-succeeded/skipped lines stand; job status
+  surfaces as `processing` with a `degraded` flag rather than silently
+  stalling. No line is retried past its own attempt-count budget.
 - **Client retries a timed-out single order** — same `Idempotency-Key` → the
   stored response is replayed, not re-executed (§5's idempotency table).
 - **Two lines for the same `group_name` in one bulk file** (or two overlapping
@@ -813,22 +848,22 @@ every access pattern here is job-scoped.
   nothing has been processed yet, so this is a clean retry.
 - **What the user sees:** a sync call either succeeds, is cleanly skipped
   with the original order number, comes back `validation_failed` with the
-  exact reason (their input, fixable, no AD call attempted), or comes back
-  `failed` with a retryable/non-retryable downstream error — in ~1.5s for a
-  single order, scaling predictably with batch size for a small batch (§1's
-  NFR), never an open-ended hang. A bulk job always finishes in a *terminal*
-  state visible via
-  `GET /v1/order-jobs/{id}` (never "stuck"), with per-line detail for exactly
-  the lines that were skipped, failed validation, or failed downstream —
-  never an all-or-nothing rollback of 4,500 orders because of one bad group
-  name.
+  exact reason (their input, fixable, no mktplace call attempted), or comes
+  back `failed` with a retryable/non-retryable downstream error — in ~1.5s
+  for a single order, scaling predictably with batch size for a small batch
+  (§1's NFR — **assuming mktplace's response is final, §9**), never an
+  open-ended hang. A bulk job always finishes in a *terminal* state visible
+  via `GET /v1/order-jobs/{id}` (never "stuck"), with per-line detail for
+  exactly the lines that were skipped, failed validation, or failed
+  downstream — never an all-or-nothing rollback of 4,500 orders because of
+  one bad group name.
 
 ## 8. Scale evolution
 
-**Current bottleneck:** the confirmed **100 requests/minute** AD-provisioning
-rate limit (§2) — not our own compute or storage, and not even close. A
-4,500-order job is a **~45-minute** job purely from that number; nothing
-about workers, queues, or the database changes that.
+**Current bottleneck:** the confirmed **100 requests/minute** mktplace
+order-submission rate limit (§2) — not our own compute or storage, and not
+even close. A 4,500-order job is a **~45-minute** job purely from that
+number; nothing about workers, queues, or the database changes that.
 
 **At 10× (≈45,000 orders/submission):** the arithmetic stops being tolerable
 — 45,000 ÷ 100/min is **~7.5 hours** for one job. This is not a "split into
@@ -839,11 +874,11 @@ constraint (§2/§6):
   not a throughput fix.
 - The **only** lever that actually changes completion time is the rate limit
   itself: renegotiate a higher quota, or — better — get a genuine **batch**
-  group-create call from the directory API (create N groups in one request,
-  counted as one unit against the limit rather than N). Splitting dispatch
-  across more queue partitions or workers does **nothing** here, unlike a
-  typical bulk-processing bottleneck — worth stating explicitly so a future
-  reader doesn't reach for "add more workers" first.
+  order-submission call from mktplace (submit N groups in one order, counted
+  as one unit against the limit rather than N). Splitting dispatch across
+  more queue partitions or workers does **nothing** here, unlike a typical
+  bulk-processing bottleneck — worth stating explicitly so a future reader
+  doesn't reach for "add more workers" first.
 - A job whose expected completion is hours, not minutes, also changes the
   CLI/UX story (§3.5): `--wait` blocking a terminal for 7.5 hours is not
   reasonable — `--watch` polling with a persisted `job_id` to resume against
@@ -861,6 +896,19 @@ constraint (§2/§6):
 
 ## 9. Open questions
 
+- **Is mktplace's response to an order submission synchronous and final, or
+  is mktplace itself asynchronous?** (§1) This design assumes the former —
+  by the time mktplace responds, the AD group either exists or the order
+  definitively failed. If mktplace instead *accepts* the order and resolves
+  it later (its own queue, its own eventual provisioning), then: `succeeded`
+  as designed here would be wrong (it would mean "mktplace accepted the
+  order," not "the group exists"); this system would need a way to learn the
+  real outcome — polling mktplace by `mktplace_order_number`, or a callback/
+  webhook mktplace calls back with; and the ~1.5s synchronous-latency model
+  in §1/§2 would need to become "accepted quickly, resolved later" even for
+  a single order, not just for bulk jobs. This is the design's single most
+  load-bearing unconfirmed assumption — everything else in §1/§2/§4 is built
+  on top of it.
 - **Should an `exists_in_ad` skip backfill an order record?** (§1's now-
   narrower out-of-scope item) The LDAP check catches a group created outside
   this process at validation time, and it's cleanly `skipped` (§3.2/§3.3) —
@@ -868,28 +916,25 @@ constraint (§2/§6):
   synthesize a historical order record at that point (so a later
   `GET ?group_name=...` finds *something*), or leave it as a `skipped` order
   with no back-reference, as designed here.
-- **What are the LDAP existence-check and FTE-check APIs' own rate limits/
-  SLAs?** Unstated (§1/§2) — the caching design (§5/§6) is this system's own
-  mitigation regardless of the answer, but the cache TTLs and whether a
-  circuit breaker is even needed depend on it.
+- **What are mktplace's, the LDAP existence-check's, and the FTE-check's own
+  rate limits/SLAs?** Unstated beyond mktplace's confirmed 100/min (§1/§2) —
+  the caching design (§5/§6) is this system's own mitigation regardless of
+  the answer, but the cache TTLs and whether a circuit breaker is even
+  needed depend on it.
 - **Is the 100/min limit truly one global ceiling**, or actually per
   app-registration/service-principal in a way that would let a second
   registration double the effective budget? This design assumes one shared
   system-wide bucket (§2/§5/§6) as the safe/conservative reading — worth
   confirming, since a per-registration limit would change the rate-limiter
   design (multiple buckets, one per registration) and the §8 scale story.
-- **Does AD's own `owners` semantics distinguish "primary" from
-  "secondary"?**, or is that distinction purely this system's metadata
-  (§3.1) — `primary_owner != secondary_owner` itself is now confirmed
-  (§1/§3.2), this is only about how the two map onto AD's owner model.
+- **Does mktplace's order schema distinguish "primary" from "secondary"
+  owner**, or is that distinction purely this system's own metadata (§3.1)
+  that mktplace's API doesn't natively support? `primary_owner !=
+  secondary_owner` itself is confirmed (§1/§3.2); this is only about how the
+  two map onto whatever mktplace's own order schema accepts.
 - **Exact owner-id regex** — assumed to be an email/employee-id shape (§1);
   the real pattern (and whether `primary_owner`/`secondary_owner` must be
   the same *kind* of identifier) needs the actual policy.
-- **Which directory API variant, exactly** — classic AD (LDAP,
-  `objectGUID`) vs. Microsoft Graph/Entra ID (`id`) — decides `ad_object_id`'s
-  actual shape (§5) and the concrete request/response fields in §3.3's
-  downstream calls, which are written generically ("AD/directory
-  provisioning API") pending this.
 - Auth model (API key vs. OAuth client-credentials, and how `primary_owner`/
   `secondary_owner` are authorized to receive a new group) — assumed but not
   designed; doesn't change the shapes above either way.
@@ -906,13 +951,11 @@ constraint (§2/§6):
       exact group name, §3.4, not full-text search); logs/SLOs — deferred to
       `observability`/`distributed-logging`, not re-derived here.
 
-**Weakest dimension:** the two APIs this design now depends on for
-validation — LDAP existence-check and active-FTE-check — have **unstated
-capacity** (§1/§2/§9). Every number in §2 for them (9,000 uncached calls,
-~50–200 cached) is this design's own estimate of the load it will offer, not
-a confirmed budget those systems can absorb; the caching strategy (§5/§6) is
-built to reduce that load regardless, but whether it reduces it *enough*
-can't be confirmed until those APIs' real limits are known. §9's other open
-questions (whether the 100/min limit is truly global, the `exists_in_ad`
-backfill decision, the exact owner-id regex) are the design's next-most
-load-bearing choices, but all are second to this one.
+**Weakest dimension:** whether **mktplace's order response is synchronous
+and final** (§9, top question) — this isn't a scale or storage risk like the
+design's earlier weakest points, it's a correctness-of-the-model risk: if
+the assumption is wrong, §1's latency NFR, §4's pipeline, and the meaning of
+`succeeded` throughout this document all need to change, not just get
+tuned. Everything else in §9 (unstated LDAP/FTE capacity, the
+`exists_in_ad` backfill decision, the exact owner-id regex) is real but
+secondary to this one.
