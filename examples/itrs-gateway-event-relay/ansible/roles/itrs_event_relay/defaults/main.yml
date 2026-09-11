@@ -3,31 +3,39 @@
 # docs/design/itrs-gateway-event-script.md §2/§4 for where the numeric
 # defaults (workers, queue size, timeouts, breaker thresholds) come from.
 
-itrs_relay_user: itrs-relay
-itrs_relay_group: itrs-relay
+# The single system account both binaries run as. itrs-notify's runtime
+# identity isn't actually chosen here — Geneos forks it as part of the
+# Gateway's own process tree, so it always runs as whatever user Geneos's
+# Effects already run as. Setting itrs_relay_user to that SAME account
+# (rather than creating a separate dedicated account for the daemon) is
+# what keeps this single-user: no shared group, no setgid directory, no
+# cross-user permission plumbing — see tasks/main.yml.
+#
+# CONFIRM THIS matches the real account before rollout (must already
+# exist — see itrs_relay_manage_user below). The placeholder here is a
+# guess, not a default worth deploying as-is.
+itrs_relay_user: geneos
+itrs_relay_group: geneos
+
+# Leave false (the expected case): the Geneos install already created
+# this account, and this role only needs to use it, not own its lifecycle.
+# Set true only if this account doesn't exist yet and this role should
+# create it — see tasks/main.yml's guarded user/group tasks.
+itrs_relay_manage_user: false
 
 itrs_relay_install_dir: /opt/itrs-event-relay
 itrs_notify_install_dir: /opt/itrs-notify
 
-# Shared, setgid, group-writable — both the daemon (itrs_relay_user) and
-# whatever user Geneos's Effects run as (itrs_geneos_user) need to create
-# and, for the daemon's own rotate/replay, rename/delete files here
-# regardless of which of the two users originally created them. See
-# tasks/main.yml for why this is managed explicitly rather than left to
-# systemd's StateDirectory= (which would default to owner-only 0750,
-# unreachable by a different Geneos-effect user).
+# Single owner now (itrs_relay_user, for both the daemon and itrs-notify's
+# disk-fallback writes) — plain 0750, no setgid needed. See tasks/main.yml
+# for why this is created explicitly rather than left to systemd's
+# StateDirectory= (its default 0750 would've been fine too now that
+# there's only one user, but managing it here keeps the path stable
+# across a systemd-unit rewrite).
 itrs_relay_spool_dir: /var/spool/itrs-event-relay
 
-# Systemd RuntimeDirectory= name -> /run/itrs-event-relay. Only the daemon
-# itself needs to create this (systemd pre-creates it as root before
-# dropping to itrs_relay_user); itrs-notify only needs to *connect* to the
-# socket inside it, which 0755 traversal + a 0666 socket file (event-relay
-# chmods its own socket) already allows for any user.
+# Systemd RuntimeDirectory= name -> /run/itrs-event-relay.
 itrs_relay_runtime_dir_name: itrs-event-relay
-
-# CONFIRM THIS before rollout — see docs/design/itrs-gateway-event-script.md
-# §10 "open questions". This is only a placeholder default.
-itrs_geneos_user: geneos
 
 # Built once in CI (see ../../README.md "Build"), not compiled on any of
 # the ~80 target hosts — they get a copied static binary, nothing else.

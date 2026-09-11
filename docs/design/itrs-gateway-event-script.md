@@ -373,8 +373,19 @@ fills.
   architecture mix before assuming one build artifact covers all 80.
 - ~~Binary distribution mechanism~~ **Resolved: Ansible.** See
   `examples/itrs-gateway-event-relay/ansible/` — a role/playbook that
-  deploys both binaries, the systemd unit, and (the part worth reading
-  even if Ansible itself is old news) a shared, setgid spool directory
-  with the two binaries' different system users both able to write it,
-  rolled out in `serial: "10%"` batches rather than to all ~80 hosts/regions
-  in one play.
+  deploys both binaries and the systemd unit, rolled out in `serial: "10%"`
+  batches rather than to all ~80 hosts/regions in one play.
+- ~~Does `event-relay` need its own dedicated system user, separate from
+  whatever account Geneos's Effects (and so `itrs-notify`) run as?~~
+  **Resolved: no, not in this deployment.** An earlier draft gave the
+  daemon a separate dedicated account on general least-privilege grounds,
+  which then required a shared setgid spool directory to let both
+  accounts write it. Confirmed with the org: Geneos's own runtime account
+  is already minimal and dedicated, with no broader host access — so
+  `event-relay` runs as that *same* account instead, and the setgid
+  plumbing goes away entirely (plain owner-only `0750` spool dir, one
+  owner). If a future environment's Geneos account is broadly privileged
+  instead, revisit this — keep the daemon on its own minimal account
+  there and bring the setgid-group approach back (or a `sudo`-scoped
+  single-user variant), rather than inheriting whatever that account can
+  already touch.

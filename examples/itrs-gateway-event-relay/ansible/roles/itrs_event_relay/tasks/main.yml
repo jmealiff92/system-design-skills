@@ -1,11 +1,16 @@
 ---
-- name: Create the itrs-relay group
+# Off by default (see defaults/main.yml): the expected case is that
+# itrs_relay_user is Geneos's own existing service account, managed by
+# whatever installed Geneos, not this role. Only set
+# itrs_relay_manage_user: true if that account genuinely doesn't exist yet.
+- name: Create the relay group
   ansible.builtin.group:
     name: "{{ itrs_relay_group }}"
     system: true
     state: present
+  when: itrs_relay_manage_user
 
-- name: Create the itrs-relay system user
+- name: Create the relay system user
   ansible.builtin.user:
     name: "{{ itrs_relay_user }}"
     group: "{{ itrs_relay_group }}"
@@ -13,19 +18,7 @@
     shell: /usr/sbin/nologin
     create_home: false
     state: present
-
-# The daemon and Geneos's own trigger-running user are different accounts,
-# but both need write access to the shared spool: the daemon (crash
-# recovery, breaker-open re-spool, rotate/rename during drain) and
-# itrs-notify (its disk fallback when the daemon is unreachable/busy).
-# Sharing a group + setgid directory (below) is the standard way to do
-# that without loosening the directory to world-writable.
-- name: Add the Geneos runtime user to the shared spool group
-  ansible.builtin.user:
-    name: "{{ itrs_geneos_user }}"
-    groups: "{{ itrs_relay_group }}"
-    append: true
-  when: itrs_geneos_user is defined and itrs_geneos_user | length > 0
+  when: itrs_relay_manage_user
 
 - name: Create install directories
   ansible.builtin.file:
@@ -39,17 +32,16 @@
     - "{{ itrs_notify_install_dir }}"
     - /etc/itrs-event-relay
 
-# setgid (the leading 2 in "2775") makes every file/dir created inside
-# inherit this directory's group regardless of which user created it, so
-# the daemon can always rename/delete files itrs-notify's fallback path
-# wrote (and vice versa is never needed, but symmetry costs nothing here).
+# itrs-notify (its disk fallback) and event-relay (crash recovery,
+# breaker-open re-spool, rotate/rename during drain) both write here — a
+# plain owner-only 0750 is enough because both run as itrs_relay_user.
 - name: Create the shared spool directory
   ansible.builtin.file:
     path: "{{ itrs_relay_spool_dir }}"
     state: directory
-    owner: root
+    owner: "{{ itrs_relay_user }}"
     group: "{{ itrs_relay_group }}"
-    mode: "2775"
+    mode: "0750"
 
 - name: Map this host's architecture to a GOARCH suffix
   ansible.builtin.set_fact:

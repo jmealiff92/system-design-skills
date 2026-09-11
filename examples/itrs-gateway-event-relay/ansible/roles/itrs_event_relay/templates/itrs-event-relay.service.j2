@@ -24,10 +24,9 @@ EnvironmentFile=/etc/itrs-event-relay/env
 
 # Root pre-creates /run/{{ itrs_relay_runtime_dir_name }} owned by
 # {{ itrs_relay_user }} before dropping privileges — this is what lets a
-# non-root daemon user bind a socket under /run at all (see the design
-# doc's Ansible-role notes). The spool dir is NOT managed this way (it
-# needs cross-user write access the daemon's own UID can't grant on its
-# own) — the role's tasks/main.yml creates it explicitly instead.
+# non-root daemon user bind a socket under /run at all. The spool dir is
+# NOT managed this way — the role's tasks/main.yml creates it explicitly,
+# owned by this same user, so it's stable across a unit-file rewrite.
 RuntimeDirectory={{ itrs_relay_runtime_dir_name }}
 User={{ itrs_relay_user }}
 Group={{ itrs_relay_group }}

@@ -78,10 +78,11 @@ Ansible deploys.
 
 **Use `ansible/`** — see `ansible/README.md` for the full walkthrough
 (inventory, vault-managed EMS token, canary-then-wave rollout across the
-~80 hosts). It handles both binaries, the systemd unit, and the shared
-spool directory's cross-user permissions (`itrs-notify` and `event-relay`
-run as different system users — see that README for why a plain
-`chmod 777` isn't the right fix).
+~80 hosts). `event-relay` runs as the *same* system account Geneos's
+Effects already run as (`itrs_relay_user`, defaulting to a placeholder you
+must confirm) rather than a separate dedicated one — see that README's
+"Why this shape" for when that's the right call vs. when to keep the
+daemon on its own account instead.
 
 For understanding what gets deployed and why (skip if you're only running
 the playbook):
@@ -89,8 +90,7 @@ the playbook):
 1. **`event-relay`** runs as a systemd service, one per Gateway host,
    co-located with the Gateway so the hand-off socket is local:
    `ansible/roles/itrs_event_relay/templates/itrs-event-relay.service.j2`
-   is the canonical unit definition — read it rather than hand-rolling one,
-   since it encodes the cross-user spool-permission fix above.
+   is the canonical unit definition — read it rather than hand-rolling one.
 2. **`itrs-notify`** is just a file Geneos invokes — no service, no
    install step beyond the binary being present. Point a Gateway Effect at:
    - **Command:** `/opt/itrs-notify/itrs-notify` (the Ansible role's default

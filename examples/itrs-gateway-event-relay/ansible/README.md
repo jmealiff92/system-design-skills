@@ -14,15 +14,18 @@ design's "nothing extra to install" bias.
   CI, drop the artifacts where `itrs_relay_binaries_dir` points (default
   `../dist/`, i.e. next to this `ansible/` directory), and this role
   fetches the right one per host via `ansible_architecture`.
-- **A shared, setgid spool directory, not systemd's `StateDirectory=`.**
-  `itrs-notify`'s disk-fallback path and `event-relay`'s daemon run as
-  different system users (Geneos's own runtime user vs. `itrs-relay`).
-  Systemd's `StateDirectory=` defaults to `0750`, owner-only — a different
-  user couldn't write the fallback spool. The role instead creates
-  `/var/spool/itrs-event-relay` explicitly as `root:itrs-relay`, mode
-  `2775` (setgid), and adds `itrs_geneos_user` to the `itrs-relay` group,
-  so either user can create *and* the daemon can later rename/delete files
-  the other user created during its rotate/replay cycle.
+- **One shared system account for both binaries, not two.** `itrs-notify`
+  doesn't get to pick its own runtime identity — Geneos forks it as part
+  of the Gateway's own process tree, so it always runs as whatever account
+  Geneos's Effects already run as. `event-relay` is ours to place, so
+  `itrs_relay_user` is set to that *same* existing account rather than a
+  new dedicated one — this only holds up because that account is already
+  a minimal, purpose-built service account with no broader host access;
+  if yours is a general-purpose/broadly-privileged account instead, keep
+  the daemon on its own dedicated account and share write access via a
+  setgid group directory instead (ask if you need that variant). One user
+  means a plain owner-only `0750` spool directory — no shared group, no
+  setgid, no cross-user permission plumbing.
 - **`serial: "10%"` in `site.yml`.** ~80 hosts across regions is exactly
   the situation `resilience-failure`'s blast-radius thinking applies to
   deployment itself, not just runtime: a bad binary or config value should
@@ -30,12 +33,15 @@ design's "nothing extra to install" bias.
 
 ## Confirm before rollout
 
-- **`itrs_geneos_user`** (`roles/itrs_event_relay/defaults/main.yml`) — the
-  actual system user Geneos's Effects run as on your Gateway hosts. The
-  default (`geneos`) is a placeholder; get this wrong and `itrs-notify`'s
-  disk-fallback writes will fail with a permission error precisely when
-  it's needed most (the daemon is down). See
-  `docs/design/itrs-gateway-event-script.md` §10.
+- **`itrs_relay_user` / `itrs_relay_group`**
+  (`roles/itrs_event_relay/defaults/main.yml`) — must match the *actual*
+  system account Geneos's Effects run as on your Gateway hosts. The
+  default (`geneos`) is a placeholder; get this wrong and either
+  `event-relay` won't start as that account, or `itrs-notify`'s
+  disk-fallback writes fail with a permission error precisely when it's
+  needed most (the daemon is down). Leave `itrs_relay_manage_user: false`
+  (the default) since this account already exists — the role only needs
+  to use it, not create it.
 - **`itrs_goarch_map`** — extend it if any region runs a non-`x86_64` /
   non-`aarch64` host; an unmapped architecture fails that host's play
   loudly (see `tasks/main.yml`) rather than silently deploying nothing or
