@@ -1,0 +1,57 @@
+---
+- name: Create install directory
+  ansible.builtin.file:
+    path: "{{ itrs_notify_install_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create the dead-letter directory
+  ansible.builtin.file:
+    path: "{{ itrs_notify_dead_letter_dir }}"
+    state: directory
+    owner: "{{ itrs_notify_user }}"
+    group: "{{ itrs_notify_group }}"
+    mode: "0750"
+
+- name: Create the secrets file's parent directory
+  ansible.builtin.file:
+    path: "{{ itrs_notify_env_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Map this host's architecture to a GOARCH suffix
+  ansible.builtin.set_fact:
+    itrs_goarch: "{{ itrs_goarch_map[ansible_facts['architecture']] | default(omit) }}"
+
+- name: Fail loudly on an unmapped architecture rather than silently deploying the wrong binary
+  ansible.builtin.fail:
+    msg: >-
+      No itrs_goarch_map entry for architecture={{ ansible_facts['architecture'] }}
+      on {{ inventory_hostname }}. Add it (and build that GOARCH's binary)
+      before including this host in the rollout.
+  when: itrs_goarch is not defined
+
+- name: Deploy the itrs-notify binary
+  ansible.builtin.copy:
+    src: "{{ itrs_notify_binaries_dir }}/itrs-notify-linux-{{ itrs_goarch }}"
+    dest: "{{ itrs_notify_install_dir }}/itrs-notify"
+    owner: root
+    group: root
+    mode: "0755"
+    # No handler/restart/reload needed anywhere in this role: there's no
+    # long-running process. Geneos forks itrs-notify fresh on every
+    # trigger, so the very next trigger after this copy already runs the
+    # new binary, and the next trigger after the env-file write below
+    # already picks up a changed EMS URL/token the same way.
+
+- name: Write the EMS URL / token file
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ itrs_notify_env_file }}"
+    owner: "{{ itrs_notify_user }}"
+    group: "{{ itrs_notify_group }}"
+    mode: "0600"

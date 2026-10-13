@@ -1,146 +1,131 @@
-# Benchmark: why the per-effect shell script is the wrong design
+# Benchmark: do we need the relay at the real measured volume?
 
-Empirical evidence for the argument in `docs/design/itrs-gateway-event-script.md`
-§2 — not "shell is slow" as an assertion, but three specific, reproducible
-failure shapes, measured against a representative reconstruction of the
-current approach (`itrs_notify_naive.sh` — no real production script was
-available to this session; see that file's header for what it models and
-why it's a fair stand-in). All three tests compare it directly against
-this design's `itrs-notify` + `event-relay`, under identical load.
+Revised after the real per-host numbers came in: **peak 835 events/min/host
+(~14/s), highest average across hosts 14 events/min/host (~0.23/s)** — two
+orders of magnitude below the ~1,000/s aggregate this design originally
+assumed per host (that figure turned out to be the *fleet-wide* total
+across ~80 hosts, not a per-host number). See
+`docs/design/itrs-gateway-event-script.md`'s revision history for the
+full reasoning; this file is the empirical check on that reasoning, not
+just the arithmetic.
 
-**Environment caveat.** These numbers came from a shared sandbox VM, not
-the target Gateway hardware — don't cite the absolute millisecond values in
-a stakeholder doc without re-running on (or close to) real Gateway
-hardware first (`run_all.sh` reproduces every test below). What will not
-change on different hardware is the *shape* of each result: unbounded vs.
-bounded resource growth, and hang vs. no-hang under a stuck backend — those
-are structural, not a hardware artifact.
+**Bottom line: no, the relay isn't needed at this volume.** `itrs-notify`
+now POSTs directly to the EMS itself — bounded per-attempt timeout, a
+small retry budget, a local dead-letter file on exhausted/permanent
+failure — no daemon, no Unix-socket hand-off, no connection pool, no
+circuit breaker, no queue. The three tests below check that decision
+empirically rather than by arithmetic alone, and still keep the one
+naive-script comparison that matters regardless of volume: a missing
+timeout is a bug, not something that needed a relay to work around.
 
-## Test A — p99 latency under concurrency, healthy backend
+**Environment caveat.** Numbers came from a shared sandbox VM — don't cite
+the absolute milliseconds in a stakeholder doc without re-running
+(`run_all.sh`) on real Gateway hardware first. The *shape* (naive
+degrades and eventually hangs; the hardened single binary stays bounded)
+is what's structural, not the hardware artifact.
 
-Fired C concurrent invocations of each approach against a perfectly
-healthy, zero-latency, localhost stand-in EMS (`fake_ems_healthy.py`) and
-timed each invocation's own wall-clock (fork → exit). `run_test_a.sh`.
+## Test A — latency across concurrency, healthy backend
 
-| Concurrency | naive p50 | naive p99 | naive max | Go p50 | Go p99 | Go max |
+Real per-host peak (14/s) implies, by Little's Law, an expected in-flight
+concurrency around **N ≈ λ×W ≈ 14 × 0.3s ≈ 4** even at sustained peak.
+Tested 1, 4, 14 (the actual measured range), then 50 and 140 as stress
+margins (3.5× and 10× past the measured peak) to see where each approach
+actually breaks, not just where the math says it should be fine.
+
+| Concurrency | naive p50 | naive p99 | naive max | notify p50 | notify p99 | notify max |
 |---:|---:|---:|---:|---:|---:|---:|
-| 10 | 34ms | 40ms | 40ms | 13ms | 16ms | 16ms |
-| 50 | 165ms | 1,359ms | 1,359ms | 56ms | 81ms | 81ms |
-| 200 | 1,212ms | 1,477ms | 1,541ms | 74ms | 143ms | 152ms |
-| 500 | 593ms | 3,346ms | 4,393ms | 61ms | 117ms | 131ms |
-| 1000 | **466ms** | **5,189ms** | **6,184ms** | 58ms | 116ms | 141ms |
+| 1 | 51ms | 51ms | 51ms | 11ms | 11ms | 11ms |
+| 4 | 25ms | 26ms | 26ms | 11ms | 11ms | 11ms |
+| 14 (= measured peak) | 72ms | 80ms | 80ms | 38ms | 56ms | 56ms |
+| 50 (3.5× peak) | 146ms | **1,153ms** | 1,153ms | 90ms | 298ms | 298ms |
+| 140 (10× peak) | 274ms | **1,398ms** | 1,436ms | 350ms | 481ms | 485ms |
 
-(`run_all.sh`'s output, captured on a shared sandbox VM — a second run of
-the same script produced different absolute numbers, e.g. 1000-concurrency
-naive p50 as low as 466ms one run and 597ms another, both times with a
-long tail well past a second; run-to-run *variance* is expected on shared
-hardware, but naive's p99/max blowing through the 500ms budget by 2–10× at
-peak concurrency, against Go staying under ~150ms throughout, reproduced
-identically every time this was run.)
+**Finding:** across the entire *actually measured* range (1–14), both
+approaches are fast and nowhere near the 500ms SLA, exactly as Little's
+Law predicted — there's no concurrent load here for a pool or a queue to
+help with. The gap only opens up once concurrency is pushed well past
+anything measured: at 10× peak, naive's p99 already exceeds the SLA by
+nearly 3×, while the single hardened binary (no pooling, no daemon — just
+a bounded timeout) stays under it, with room to spare. The relay's old
+job — keeping tail latency flat under heavy concurrency — isn't needed at
+the real number, and the plain binary already has enough headroom to
+survive a 10× surprise without it.
 
-**Finding:** naive's tail latency (p99/max) is the number that matters for
-an SLA, and it degrades sharply and unpredictably with concurrency — into
-multiple *seconds* at the stated peak — against a backend with zero real
-network latency and zero processing time. Every millisecond of real EMS
-latency, TLS handshake to a real (non-localhost) host, or network round
-trip in production stacks on top of this, not instead of it. The Go
-numbers here aren't even the relevant ones for the SLA (see Test C —
-`itrs-notify`'s own wall-time doesn't depend on the EMS at all); they're
-shown for a fair apples-to-apples comparison under the same synthetic
-concurrency, and they stay flat and sub-150ms where naive does not.
+## Test B — TCP `TIME_WAIT`, sustained at the real peak rate
 
-## Test B — TCP connection reuse (`TIME_WAIT` accumulation)
-
-Every `itrs_notify_naive.sh` invocation is a separate OS process running a
-separate `curl`, so there is categorically no way for it to reuse a TCP
-connection across triggers, no matter how the server behaves. Measured the
-number of client-side sockets left in `TIME_WAIT` (`count_time_wait.py
-<port> --client` — counts by *remote* port, i.e. connections *this* host
-made outward, since that's the Gateway host's own ephemeral-port budget,
-not the fake EMS's).
+Fired the naive script at ~14/s for 10 seconds (140 invocations total) —
+sustaining the measured *peak* rate for longer than a real peak likely
+lasts, rather than the burst-all-at-once shape Test A already covers.
 
 ```
-naive : 300 invocations -> before=0   after=300  (delta=300, exactly 1:1)
-Go    : 300 invocations -> before=300 after=300  (delta=0)
-Go    : 300 more        -> before=300 after=300  (delta=0, pool stays warm)
+naive : client TIME_WAIT to :8950  before=0 after=140  delta=140
 ```
 
-**Finding:** every naive invocation leaves exactly one socket in
-`TIME_WAIT`; the Go daemon's pooled, kept-alive connections leave none. The
-naive number is not "slow," it's **unbounded and directly proportional to
-trigger volume** — which turns into a hard number at the stated peak:
+**Finding:** 140 sockets in `TIME_WAIT`, against a Linux ephemeral port
+range commonly ~28,000–30,000 — under 0.5%. This was the original design's
+loudest argument for a relay (at the *assumed* 1,000/s it projected to
+~60,000 `TIME_WAIT` sockets, more than the whole port range); at the real
+per-host rate it isn't a concern at all, with or without connection
+pooling. (And this test already uses the worst-case assumption — sustained
+peak for 10 whole seconds; the measured *average* is ~60× lower than the
+peak, so even this is a pessimistic input.)
 
-> 1,000 new outbound connections/s × ~60s default Linux `TIME_WAIT` (2×MSL)
-> ≈ **up to 60,000 sockets parked in `TIME_WAIT` at any given moment**, on
-> a single Gateway host, from this one integration.
+## Test C — an unresponsive backend (the one finding that doesn't change)
 
-The default Linux ephemeral port range (`net.ipv4.ip_local_port_range`) is
-commonly ~28,000 ports. The naive design would exhaust the Gateway host's
-entire outbound port space before accounting for anything else that host
-does — new connections (this integration's and any other process's) start
-failing with `EADDRNOTAVAIL`. That's not a performance complaint, it's an
-outage the monitoring pipeline causes on its own host — and with ~80
-Gateway hosts, it's 80 independent occurrences of it, one per host/region,
-each hitting whenever that host's trigger rate sustains near peak.
-
-## Test C — an unresponsive backend (the sharpest failure mode)
-
-`fake_ems_hung.py` accepts the TCP connection and then never reads or
-writes another byte — no refusal, no RST, nothing a caller can fail fast
-on. `curl` has **no default response-read timeout**; without an explicit
-`--max-time`/`--connect-timeout` (absent from the naive script, and easy to
-forget in a quickly-written effect script), this hangs the calling process
-indefinitely.
+Same test as the earlier draft, same fixture (`fake_ems_hung.py`: accepts
+the TCP connection, never reads or writes again). This finding isn't about
+volume — it's about whether the trigger-side program has *any* bound on
+how long it'll wait, and that's true at 1 trigger or 1,000.
 
 ```
-naive: 20 concurrent triggers -> all 20 curl+bash processes still BLOCKED
-       after 28+ seconds (checked twice; would still be blocked now)
+naive (no timeout): 5 triggers -> all 5 curl+bash processes still
+  BLOCKED after 8+ seconds (indefinitely, in production)
 
-Go:    the same 20 triggers, same hung backend
-       itrs-notify wall-time: p50=26ms p99=32ms max=32ms (unaffected —
-         it never touches the network; see design doc §4)
-       event-relay's own log: breaker opens after the configured
-         consecutive-failure threshold; all 20 land in the DLQ with
-         reason="context deadline exceeded", attempts=2 — inspectable,
-         not lost, and zero OS processes left behind
+itrs-notify (bounded timeout + 1 retry, no relay): same 5 triggers
+  wall-time: p50=399ms p99=405ms max=405ms (under the 500ms SLA)
+  5/5 recorded in the dead-letter file with
+    failure_reason="context deadline exceeded", attempts=2
+  0 leftover OS processes
 ```
 
-**Finding:** the naive design has no ceiling on this failure — every
-trigger against a stuck EMS is one more permanently blocked process, at
-the actual trigger rate (up to 1,000/s at peak). Given enough time (or a
-short outage during a busy period), the Gateway host runs out of process
-table entries, file descriptors, or memory **because of this integration**,
-regardless of how good the EMS's actual uptime is otherwise — a single
-slow response or misbehaving proxy is enough to trigger it, not just a
-full EMS outage. The Go daemon's per-attempt timeout, retry cap, and
-circuit breaker together put a hard, configured ceiling on this
-(`ITRS_RELAY_WORKERS` × `ITRS_RELAY_ATTEMPT_TIMEOUT_S` bounds the total
-resource any EMS misbehavior can ever consume), and the trigger-side
-program is never blocked on the network at all.
+**Finding:** the fix was always a timeout on the HTTP call, not a second
+long-running process. `itrs-notify` carries that fix directly now — no
+relay required to get it.
+
+## What this changes vs. the earlier draft
+
+- **Drop:** `event-relay`, the Unix-socket hand-off protocol, the
+  in-memory queue, the circuit breaker, connection pooling.
+- **Keep, because they're not about volume:** a bounded per-attempt
+  timeout + small retry budget (this test's Test C), safe JSON encoding
+  (not string interpolation — see the note below), an `Idempotency-Key`
+  per event, a local dead-letter file instead of silently dropping a
+  failed delivery, and Go as the implementation language (the
+  environment-consistency argument across ~80 regionally different hosts
+  has nothing to do with request volume).
+- **Revisit if a future number changes this:** see
+  `docs/design/itrs-gateway-event-script.md` §8 for the specific
+  threshold (sustained per-host rate, not a one-off burst) that would
+  justify bringing the relay back.
 
 ## A secondary, independent finding: correctness
 
-`itrs_notify_naive.sh` builds its JSON body by string interpolation
-(`"headline":"${_HEADLINE}"`). A headline or message containing a `"` or
-`\` — plausible free text from a monitored application — produces invalid
-JSON the EMS will reject outright, silently, with no retry. This is
-unrelated to the performance findings above and would exist even at low
-volume; worth raising alongside them since it's the same root cause
-(a script that was fast to write, not designed to the contract).
+`itrs_notify_naive.sh` (kept only as the "what not to do" baseline here)
+builds its JSON body by string interpolation. A headline or message
+containing a `"` or `\` produces invalid JSON the EMS will reject
+outright. `itrs-notify` uses `encoding/json` and never had this problem —
+noted again here since it's unrelated to the volume question and would
+matter even at the lowest possible trigger rate.
 
 ## Reproducing this
 
 ```bash
 cd examples/itrs-gateway-event-relay
 go build -o /tmp/bench/itrs-notify ./cmd/itrs-notify
-go build -o /tmp/bench/event-relay ./cmd/event-relay
 cd benchmark
 ./run_all.sh    # runs Tests A, B, and C in sequence, printing each result
 ```
 
-Each test starts and tears down its own fake EMS / relay daemon — see
-`run_all.sh` for the exact sequencing if you want to run one test in
-isolation or against a real (non-localhost) EMS endpoint instead. Test C's
-cleanup step force-kills the still-hung `curl` processes it just proved are
-stuck; the resulting `line 32: <pid> Killed curl ...` lines in the output
-are bash reporting that cleanup, not a test failure.
+Test C's cleanup step force-kills the still-hung `curl` processes it just
+proved are stuck; the resulting `line 32: <pid> Killed curl ...` lines in
+the output are bash reporting that cleanup, not a test failure.

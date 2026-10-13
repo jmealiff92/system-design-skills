@@ -1,64 +1,59 @@
 # Deploying with Ansible
 
-Deploys `event-relay` (as a systemd service) and `itrs-notify` (as a plain
-binary for the Geneos Effect to invoke) to the Gateway fleet. Pure
-`ansible.builtin` — no collections to install, matching the rest of this
-design's "nothing extra to install" bias.
+Deploys `itrs-notify` (a plain binary Geneos invokes directly as an
+Effect) to the Gateway fleet — its EMS URL/token, a dead-letter directory
+for failed deliveries, nothing else. Pure `ansible.builtin` — no
+collections to install.
+
+There is no daemon to deploy here. An earlier version of this role also
+shipped `event-relay` as a systemd service; that's gone now that the real
+per-host volume (peak ~835/min, ~14/s) turned out to be far below what
+justified a relay — see `../README.md`'s "Why one binary" and
+`../../../docs/design/itrs-gateway-event-script.md`'s revision history.
+If you're looking at an older checkout with a `roles/itrs_event_relay/`
+directory, that's the stale version; this role replaces it.
 
 ## Why this shape
 
 - **A static binary per architecture, copied not compiled.** The role
-  never runs `go build` on a target host — none of the ~80 Gateway hosts
-  need a Go toolchain, matching the whole reason this design is Go in the
-  first place (see the top-level README's "Why Go" section). Build once in
-  CI, drop the artifacts where `itrs_relay_binaries_dir` points (default
-  `../dist/`, i.e. next to this `ansible/` directory), and this role
-  fetches the right one per host via `ansible_architecture`.
-- **One shared system account for both binaries, not two.** `itrs-notify`
-  doesn't get to pick its own runtime identity — Geneos forks it as part
-  of the Gateway's own process tree, so it always runs as whatever account
-  Geneos's Effects already run as. `event-relay` is ours to place, so
-  `itrs_relay_user` is set to that *same* existing account rather than a
-  new dedicated one — this only holds up because that account is already
-  a minimal, purpose-built service account with no broader host access;
-  if yours is a general-purpose/broadly-privileged account instead, keep
-  the daemon on its own dedicated account and share write access via a
-  setgid group directory instead (ask if you need that variant). One user
-  means a plain owner-only `0750` spool directory — no shared group, no
-  setgid, no cross-user permission plumbing.
-- **`serial: "10%"` in `site.yml`.** ~80 hosts across regions is exactly
-  the situation `resilience-failure`'s blast-radius thinking applies to
-  deployment itself, not just runtime: a bad binary or config value should
-  hit a canary batch, not the whole fleet, in one play.
+  never runs `go build` on a target host. Build once in CI, drop the
+  artifact where `itrs_notify_binaries_dir` points (default `../dist/`),
+  and this role fetches the right one per host via `ansible_architecture`.
+- **A secrets file, not a systemd `EnvironmentFile=`.** With no
+  long-running process, there's no unit file to carry one. The role
+  writes `/etc/itrs-notify/env` (mode `0600`) instead, and
+  `cmd/itrs-notify/main.go` reads it at startup — filling in only what
+  Geneos's own Effect environment didn't already set, so an
+  Effect-level override still wins if you ever need one.
+- **`serial: "10%"` in `site.yml`.** Still worth keeping even for a
+  single binary with no service to restart: ~80 hosts across regions
+  means a bad build should hit a canary batch, not the whole fleet, in
+  one play.
 
 ## Confirm before rollout
 
-- **`itrs_relay_user` / `itrs_relay_group`**
-  (`roles/itrs_event_relay/defaults/main.yml`) — must match the *actual*
-  system account Geneos's Effects run as on your Gateway hosts. The
-  default (`geneos`) is a placeholder; get this wrong and either
-  `event-relay` won't start as that account, or `itrs-notify`'s
-  disk-fallback writes fail with a permission error precisely when it's
-  needed most (the daemon is down). Leave `itrs_relay_manage_user: false`
-  (the default) since this account already exists — the role only needs
-  to use it, not create it.
+- **`itrs_notify_user` / `itrs_notify_group`**
+  (`roles/itrs_notify/defaults/main.yml`) — must match the real system
+  account Geneos's Effects run as, so the dead-letter directory and
+  secrets file are readable/writable by the process that actually needs
+  them. The default (`geneos`) is a placeholder. This role does not
+  create the account — it's expected to already exist.
 - **`itrs_goarch_map`** — extend it if any region runs a non-`x86_64` /
   non-`aarch64` host; an unmapped architecture fails that host's play
   loudly (see `tasks/main.yml`) rather than silently deploying nothing or
   the wrong binary.
 - **`itrs_ems_token`** — don't put the real value in `defaults/main.yml`
-  or a plaintext `group_vars` file. Use `ansible-vault` (e.g. a
-  `group_vars/itrs_gateway_hosts/vault.yml` encrypted file, or `--ask-vault-pass`
-  / a vault password file) and reference it from a normal `group_vars` file
-  as `itrs_ems_token: "{{ vault_itrs_ems_token }}"`.
+  or a plaintext `group_vars` file. Use `ansible-vault` and reference it
+  from a normal `group_vars` file as
+  `itrs_ems_token: "{{ vault_itrs_ems_token }}"`.
 
 ## Usage
 
 ```bash
-# 1. Build the binaries once (see ../README.md "Build"), one pair per
+# 1. Build the binary once (see ../README.md "Build"), one per
 #    architecture your fleet actually runs, named exactly:
-#      dist/event-relay-linux-amd64   dist/itrs-notify-linux-amd64
-#      dist/event-relay-linux-arm64   dist/itrs-notify-linux-arm64   (if needed)
+#      dist/itrs-notify-linux-amd64
+#      dist/itrs-notify-linux-arm64   (if needed)
 
 # 2. Fill in the real inventory.
 cp inventory.example.ini inventory.ini
@@ -73,11 +68,7 @@ ansible-playbook site.yml --limit itrs_gateway_us --ask-vault-pass
 ansible-playbook site.yml --ask-vault-pass   # the full fleet
 ```
 
-Idempotent: re-running only restarts `event-relay` when the binary,
-`/etc/itrs-event-relay/env`, or the unit file actually changed (via the
-role's `notify` handlers) — safe to run repeatedly, including as a
-scheduled config-drift check.
-
-`itrs-notify` needs no restart/reload after a redeploy — Geneos forks a
-fresh process per trigger, so the very next trigger after the `copy` task
-already runs the new binary.
+Idempotent: re-running only touches files that actually changed. No
+restart/reload step exists or is needed anywhere in this role — Geneos
+forks a fresh `itrs-notify` process per trigger, so the very next trigger
+after a `copy`/`template` task already sees the new binary or config.

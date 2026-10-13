@@ -1,0 +1,55 @@
+---
+# See ../../README.md for what each of these controls, and
+# docs/design/itrs-gateway-event-script.md §2/§4 for the numbers behind
+# the attempt-timeout/retry defaults. There is no daemon to configure
+# here anymore (see the design doc's revision history) — this role only
+# deploys one binary, a secrets file it reads, and the directory it
+# writes a dead-letter record to on delivery failure.
+
+# itrs-notify's runtime identity isn't actually chosen by this role —
+# Geneos forks it as part of the Gateway's own process tree, so it always
+# runs as whatever account Geneos's Effects already run as. This only
+# needs to be *named* here so the dead-letter directory and secrets file
+# can be given the right ownership; this role doesn't create or manage
+# the account itself (it's expected to already exist).
+#
+# CONFIRM THIS matches the real account before rollout. The placeholder
+# here is a guess, not a default worth deploying as-is.
+itrs_notify_user: geneos
+itrs_notify_group: geneos
+
+itrs_notify_install_dir: /opt/itrs-notify
+
+# Where itrs-notify disk-fallbacks a failed delivery after exhausting its
+# retry budget — see cmd/itrs-notify/main.go. Nothing drains this
+# automatically (there's no daemon); it's an operator-inspectable record,
+# and in practice a persistent Geneos alert condition will usually just
+# re-fire the Effect on the next evaluation cycle anyway.
+itrs_notify_dead_letter_dir: /var/spool/itrs-notify
+
+# itrs-notify has no systemd unit to carry an EnvironmentFile=, so this
+# role writes the EMS URL/token to a plain file instead
+# (cmd/itrs-notify/main.go reads it at startup, filling in only what
+# Geneos's own Effect environment didn't already set). Mode 0600, owned
+# by itrs_notify_user.
+itrs_notify_env_file: /etc/itrs-notify/env
+
+# Built once in CI (see ../../README.md "Build"), not compiled on any of
+# the ~80 target hosts — they get a copied static binary, nothing else.
+# Expected filename: itrs-notify-linux-<goarch>.
+itrs_notify_binaries_dir: "{{ playbook_dir }}/../dist"
+
+itrs_ems_url: "https://ems.internal/api/v1/events"
+# Put the real value in group_vars/vault, not here — see ../../README.md.
+itrs_ems_token: ""
+
+itrs_notify_attempt_timeout_s: 0.15
+itrs_notify_max_retries: 1
+
+# ansible_architecture -> the GOARCH suffix this design's binary is built
+# with (see ../../README.md "Build"). Extend if a region runs something
+# else; an unmapped value fails the play rather than silently deploying
+# the wrong binary (see tasks/main.yml).
+itrs_goarch_map:
+  x86_64: amd64
+  aarch64: arm64

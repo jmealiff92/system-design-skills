@@ -13,17 +13,37 @@ this design lives in `examples/itrs-gateway-event-relay/`.
 > rule that runs `env > /tmp/env.dump` before go-live, then adjust `varMap`
 > in `cmd/itrs-notify/main.go`.
 
-> **Revision note.** The original draft of this design chose a stdlib-only
-> Python script for `itrs-notify`, on the reasoning that "no dependency to
-> install" was the whole story. A later constraint invalidated that:
-> **~80 Gateway hosts across multiple regions**, with no guarantee they run
-> the same, or any, Python environment. That's the `system-design` skill's
-> "treat the architecture as a hypothesis" discipline in practice — a new
-> fact changed a decision, so the decision changed, not just the code. Both
-> `itrs-notify` and `event-relay` are now Go, built as static binaries; see
-> §6 and the language note at the top of `examples/itrs-gateway-event-relay/README.md`
-> for the reasoning. The architecture (§4) did not need to change — only
-> the implementation language of the two components it already called for.
+> **Revision history.** This design has reversed itself twice so far — kept
+> here deliberately rather than quietly edited away, since the *reasoning*
+> behind each reversal is as load-bearing as the current answer.
+>
+> 1. **Python → Go** (per-trigger script). The original draft chose a
+>    stdlib-only Python script, reasoning "no dependency to install" was
+>    the whole story. ~80 Gateway hosts across regions, with no guarantee
+>    of a shared provisioning process, invalidated that — no language
+>    runtime can be assumed present or at a consistent version. Both
+>    programs (at the time) became Go static binaries.
+> 2. **Two users → one** (deployment). A separate dedicated system account
+>    for the relay daemon, on general least-privilege grounds, turned out
+>    to be solving a problem this org didn't have: Geneos's own runtime
+>    account was already minimal and dedicated. Collapsed to one account,
+>    dropping a setgid shared-directory workaround along with it.
+> 3. **Two processes → one** (this revision, the big one). The 60,000/min
+>    figure that justified a whole relay daemon — connection pool, circuit
+>    breaker, queue — turned out to be the *fleet-wide* aggregate across
+>    ~80 hosts, not what any single host sees. Real per-host peak is
+>    **835/min (~14/s)**, highest average **14/min (~0.23/s)**. At that
+>    rate, Little's Law alone settles it (see §2) — there's no concurrent
+>    load to pool connections for, no backlog for a breaker, nothing for a
+>    queue to buffer. `event-relay` is gone; `itrs-notify` POSTs directly.
+>    Revision 2's question (does the daemon need its own user) is now moot
+>    — there's only one process, so it was never a live question in the
+>    first place, it just didn't know that yet.
+>
+> The pattern across all three: a number or a constraint changed, and the
+> *architecture* changed with it rather than being defended past the point
+> it stopped fitting — the `system-design` skill's "treat the architecture
+> as a hypothesis" discipline, applied for real rather than as a slogan.
 
 ## 1. Problem & scope
 
@@ -31,77 +51,94 @@ this design lives in `examples/itrs-gateway-event-relay/`.
 running an external program when a rule/alert/action fires — must forward
 every trigger to a downstream Event Management System (EMS) as an HTTP POST.
 
-**Non-functional constraints (given):**
-- Peak volume **60,000 triggers/min = 1,000/s**.
+**Non-functional constraints (given, as currently understood):**
+- Peak volume **per Gateway host: 835 events/min (~14/s)**. Highest
+  *average* across hosts: **14 events/min (~0.23/s)** — i.e. a ~60×
+  peak-to-average ratio; this is a bursty alerting workload, not a steady
+  telemetry stream, and the vast majority of each host's time is spent
+  near-idle. (An earlier draft read "60,000/min" as a per-host number;
+  it's the fleet-wide aggregate across ~80 hosts instead — see the
+  revision history above and §2.)
 - **Concurrency expected**, and **multiple different processes** (multiple
-  rules, samplers, and/or multiple Gateway hosts) can invoke the script at
-  the same time — there is no single caller to serialize behind.
+  rules, samplers) can invoke the program on the same host at the same
+  time — there is no single caller to serialize behind, even though the
+  *rate* is low.
 - **Latency < 500 ms.**
 - **~80 Gateway hosts, in different regions**, each independently forking
   the trigger program — no shared provisioning is assumed between them.
   This is what rules out relying on a language runtime being present, let
-  alone at a consistent version (§6).
+  alone at a consistent version (§6) — independent of the volume question.
 
 **Out of scope:** the EMS's own ingestion design (assumed to be a normal
-HTTP API); Geneos Gateway HA/config; historical backfill/replay tooling
-beyond the dead-letter file described below.
+HTTP API, and sized for the *fleet-wide* aggregate — not this design's
+concern, since nothing here pools or throttles across hosts); Geneos
+Gateway HA/config; historical backfill/replay tooling beyond the
+dead-letter file described below.
 
 **Key assumption to make explicit (GUIDE discipline: no number should be
-silently assumed):** "latency < 500 ms" is treated as **two separate
-budgets**, because a Gateway effect and an HTTP call to a third party are not
-the same clock:
-1. **Script wall-time** (fork → exec → exit, what the Gateway host pays for
-   and what any Gateway-side effect timeout is measured against).
-2. **End-to-end delivery latency** (trigger → event acknowledged by the EMS).
-
-Conflating them is what breaks this design under load — see §4.
+silently assumed):** "latency < 500 ms" is the end-to-end time from
+trigger to EMS acknowledgment, for a single `itrs-notify` process (fork →
+exec → the HTTP call → exit). With no second process in this design,
+there's only one clock to budget against now — see §4.
 
 > **Empirically validated, not just estimated.** The current production
-> approach is a shell script invoked per Effect (`curl` + no timeout/retry),
-> the exact shape this section's estimate warns about. Rather than rest on
-> the math alone, `examples/itrs-gateway-event-relay/benchmark/BENCHMARK.md`
-> load-tests a representative reconstruction of it against this design,
-> head to head, and gets hard numbers: the naive script's own p99 latency
-> alone exceeds the 500ms SLA by 2–10× at peak concurrency (against a
-> *healthy* backend), it leaves one OS-level TCP connection in `TIME_WAIT`
-> per trigger with no ceiling (≈60,000 at sustained peak — more than the
-> host's ephemeral port range), and it hangs its process **indefinitely**
-> against a backend that accepts a connection and just doesn't respond —
-> an outage in the monitoring pipeline itself, not merely a slow one. Read
-> that doc for the reproduction steps if a stakeholder needs to see it
-> proven rather than asserted.
+> approach is a shell script invoked per Effect (`curl` + no timeout/retry).
+> Rather than rest on arithmetic alone,
+> `examples/itrs-gateway-event-relay/benchmark/BENCHMARK.md` load-tests a
+> representative reconstruction of it against this design, head to head,
+> **at the real measured volume** (not the originally-assumed one) and
+> gets hard numbers: across the actually-measured concurrency range (1–14),
+> both the naive script and this design are fast and nowhere near the SLA
+> — exactly what Little's Law predicts at this rate, with no help from
+> pooling or a relay needed. The gap only opens at a 10× stress margin past
+> the measured peak, where naive's p99 exceeds the SLA by ~3× while the
+> hardened single binary (still no pooling, no daemon — just a bounded
+> timeout) stays under it. The one failure mode that doesn't improve with
+> lower volume — curl's lack of a default response-read timeout hanging a
+> process **indefinitely** against a stuck backend — was always a
+> missing-timeout bug, not a case for a relay; `itrs-notify` fixes it
+> directly. Read that doc for the reproduction steps if a stakeholder needs
+> to see any of this proven rather than asserted.
 
 ## 2. Scale estimates (`back-of-the-envelope`)
 
 | Quantity | Value | Assumption |
 |---|---|---|
-| Peak rate | 1,000 events/s | 60,000/min given |
-| Sustained/average rate | ~500 events/s | standard 2× peak factor |
+| Peak rate, per host | 14 events/s | 835/min given |
+| Highest average rate, per host | 0.23 events/s | 14/min given |
+| Peak-to-average ratio | ~60× | bursty alerting workload, not steady telemetry |
 | Envelope size | ~0.5–2 KB JSON | small structured record, see §3 |
-| Peak bandwidth | ~1.5 MB/s (~12 Mbps) | 1,000 × 1.5 KB — trivial, not a driver |
-| In-flight concurrency needed at the EMS hop | **N ≈ λ × W ≈ 1,000 × 0.15 s ≈ 150** | Little's Law, per-call budget 150 ms (§4) |
-| OS process forks/s on the Gateway host | up to 1,000/s at peak | one OS process per trigger — this **is** a driver, see §6 |
+| Peak bandwidth, per host | ~21 KB/s | 14 × 1.5 KB — trivial, never a driver |
+| **In-flight concurrency at peak (Little's Law, N ≈ λ×W)** | **N ≈ 14 × 0.3 s ≈ 4** | per-attempt-plus-retry budget ≈ 300 ms (§4) |
+| In-flight concurrency, 10× stress margin | N ≈ 140 × 0.3 s ≈ 42 | sanity check past anything measured — see benchmark Test A |
+| OS process forks/s, per host | up to ~14/s at peak | one process per trigger — trivial at this rate for *any* language |
+| `TIME_WAIT` sockets at sustained peak | ≈ 835 (14/s × ~60 s default lifetime) | vs. a ~28,000–30,000 ephemeral port range — under 3% |
 
-The number that decides the architecture is the last one, not the request
-rate itself: **1,000 fresh OS processes/second, each wanting to talk to a
-remote HTTPS endpoint**, is the shape of the problem. A naive "the script
-does `curl`/`requests.post()` and exits" design forces:
-- a fresh DNS lookup + TCP + TLS handshake per event (no connection reuse
-  possible across unrelated short-lived processes) — several round trips
-  before the POST even starts, blowing the 500 ms budget under any real EMS
-  or network latency;
-- up to ~1,000 concurrent outbound sockets/ephemeral ports and ~1,000
-  process creations per second on the Gateway host, with no shared state to
-  rate-limit, retry sanely, or circuit-break against a struggling EMS —
-  every process is its own isolated island making its own uncoordinated
-  retry decision (the exact retry-storm shape `resilience-failure` warns
-  about, just triggered by fan-out instead of a single caller).
+**None of these numbers forces a relay.** This is the opposite conclusion
+from the original (fleet-aggregate) estimate, and it's worth walking
+through exactly why, since the original reasoning wasn't wrong *given its
+input* — the input was wrong:
 
-So the core design decision (`messaging-streaming`'s framing: *move the
-slow/spiky part off the synchronous path*) is: **the Gateway-spawned script
-must not be the thing that talks to the network.** It hands the event to a
-long-running local process over local IPC and exits; that long-running
-process owns the connection pool, retries, and circuit breaker.
+- **Concurrency.** At N≈4 even under a full-timeout worst case, there's
+  nothing for a connection pool to amortize or a queue to buffer — Little's
+  Law's whole point is that concurrency, not raw rate, is what resource
+  planning answers to, and at this rate concurrency rounds to "a handful."
+- **Process-fork cost.** ~14 forks/s is trivial for literally any runtime,
+  including a slow interpreter — this was never going to be the
+  bottleneck at this rate (contrast the original 1,000/s assumption, where
+  it was the single biggest driver).
+- **`TIME_WAIT`/port exhaustion.** ~835 sockets at sustained peak is under
+  3% of a typical ephemeral port range. The original estimate's loudest
+  argument for pooling — ~60,000 `TIME_WAIT` sockets, more than the whole
+  port range, at the assumed 1,000/s — simply isn't the number that
+  applies here.
+
+**What doesn't change with volume:** a backend that accepts a TCP
+connection and never responds hangs a caller with no read timeout
+**indefinitely**, regardless of trigger rate. That's a missing
+`--max-time`-equivalent, fixed directly in `itrs-notify` with a bounded
+per-attempt timeout and a small retry budget — never actually a case for
+a relay, even under the original (wrong) volume assumption.
 
 ## 3. API / contracts (`api-design`)
 
@@ -111,7 +148,7 @@ Geneos exports the triggering context as environment variables (documented
 under *Rules, Actions & Alerts → Effects*; conventionally underscore-prefixed,
 mirroring the rule-language accessors like `rowname()`/`column()`/`value()`).
 Rather than hard-coding an exact, possibly-stale list as required fields, the
-script:
+program:
 1. captures **every** `_`-prefixed env var verbatim into an `attributes` map
    (forward-compatible — nothing is dropped even if a name is wrong or a
    version adds new ones), and
@@ -127,28 +164,15 @@ at the top). A table beats hard-coded field access precisely because fixing
 a wrong name later is a one-line edit, not a rewrite — and nothing is lost
 in the meantime because of point (1).
 
-### 3b. Local hand-off: script → relay daemon
+### 3b. Outbound: `itrs-notify` → EMS
 
-Unix domain socket, length-prefixed JSON, one frame per event:
-
-```
-→ 4-byte big-endian length | JSON payload (utf-8)
-← 1 byte ack: 'K' = queued for delivery, 'F' = daemon busy/unreachable
-```
-
-This is **not** the delivery contract — it is only "accepted for delivery,"
-matching the queue's owned semantics (`messaging-streaming`: ack-after-enqueue
-≈ at-least-once, not exactly-once). `'F'`, a timeout, or any socket error
-means the script falls back to appending straight to the on-disk spool file
-instead (§6) — the script never blocks waiting on the network.
-
-### 3c. Outbound: relay daemon → EMS
+The only network call in this design — no local hand-off, no daemon.
 
 ```
 POST /api/v1/events HTTP/1.1
 Host: ems.internal
 Content-Type: application/json
-Idempotency-Key: <event_id>          # UUID4, minted once, at the script
+Idempotency-Key: <event_id>          # UUID4, minted once, at process start
 Authorization: Bearer <token>
 
 {
@@ -166,226 +190,220 @@ Authorization: Bearer <token>
   "attributes": { "...every raw _VAR from Geneos, unmapped or not...": "..." }
 }
 
-200/202 → success, ack
-4xx (not 429) → permanent — do not retry, straight to DLQ
-429/5xx → transient — retry per policy (§4), then DLQ
+200/202 → success, exit 0
+4xx (not 429) → permanent — do not retry, straight to the dead-letter file
+429/5xx → transient — retry per policy (§4), then the dead-letter file
 ```
 
-`Idempotency-Key` is the load-bearing piece from `api-design`: the script
-mints `event_id` once, before any hand-off or retry exists, so every retry —
-whether from the relay's own backoff or a later replay out of the disk
-spool/DLQ — carries the *same* key and the EMS can dedupe a POST that
-actually landed but whose ack was lost.
+`Idempotency-Key` is the load-bearing piece from `api-design`: `event_id`
+is minted once, before the first attempt, so a retry within the same
+process carries the *same* key and the EMS can dedupe a POST that
+actually landed but whose ack was lost to a network blip.
 
 ## 4. High-level design
 
 ```
-Geneos rule/alert fires (N processes, possibly 80 hosts across regions, up to 1,000/s)
+Geneos rule/alert fires (N processes, possibly 80 hosts across regions, up to ~14/s per host)
         │  fork+exec
         ▼
- itrs-notify  (per-trigger, static Go binary, no network, no runtime deps)
+ itrs-notify  (per-trigger, static Go binary, no runtime deps)
     - reads env, builds envelope + event_id
-    - tries UDS write to local relay daemon (~ms, short timeout)
-    - on any failure: appends one line to local spool file instead
-    - exits — wall-time dominated by fork/exec, not an interpreter or the network
-        │ UDS                                  │ disk (fallback path)
-        ▼                                       │
- event-relay  (one long-running daemon per Gateway host, static Go binary)
-    - bounded in-memory queue/channel (backpressure: NACK → client spools instead)
-    - spool-drainer tails the disk spool (crash recovery + NACK fallback)
-    - N worker goroutines, shared pooled HTTP client (keep-alive, stdlib net/http)
-    - per-attempt timeout + capped retry+jitter (resilience-failure)
-    - circuit breaker around the EMS endpoint
-    - exhausted retries / breaker-open → dead-letter file
-        │ HTTPS (pooled, persistent connections)
+    - POSTs directly to the EMS: bounded per-attempt timeout, up to 1 retry+jitter
+    - on exhausted/permanent failure: appends one line to a local dead-letter file
+    - exits — wall-time dominated by fork/exec + the HTTP call, nothing else
+        │ HTTPS (one connection per process; no pooling — see below)
         ▼
                     Event Management System
 ```
 
-Each component ties back to a number or requirement from §1–§2:
-- **Two processes, not one** — the fork-per-trigger process can't hold a
-  connection pool (it doesn't live long enough to amortize a TLS handshake);
-  the daemon can, because it's long-running. This is what turns "1,000
-  independent TLS handshakes/s" into "~150–200 reused, pooled connections."
-- **Bounded queue + disk spool, not an unbounded buffer** —
-  `messaging-streaming`'s backpressure rule: absorb the burst without hiding
-  a backlog. In-memory queue sized for ~20 s of peak (20,000 items) covers
-  transient EMS slowness; anything past that (or daemon-down) spills to disk
-  rather than blocking the UDS accept loop or growing memory without bound.
-- **Circuit breaker** — without it, a slow/down EMS turns 1,000 req/s of
-  normal traffic into 1,000 req/s of *retries* piling on top, the retry-storm
-  amplifier `resilience-failure` calls out; the breaker fails fast to the
-  spool instead once the EMS is clearly unhealthy.
-- **One daemon per Gateway host, co-located** — the fast path (script→daemon)
-  is a local socket, so it stays fast (~low single-digit ms) regardless of
-  what the EMS is doing right now; if Geneos runs an HA pair of Gateways,
-  each host runs its own daemon (bulkhead — one host's spool/backlog can't
-  affect the other).
+One component, one hop. Each piece ties back to a number from §1–§2:
 
-### The two latency budgets, sized
+- **One process, not two.** At N≈4 in-flight (§2), there's no concurrent
+  load to justify a long-running process holding a connection pool — the
+  fork-per-trigger cost that made pooling necessary at the *assumed*
+  1,000/s doesn't apply at the *real* ~14/s. No pool, no breaker, no
+  queue, no local IPC protocol to maintain.
+- **No connection pooling.** Each `itrs-notify` process makes at most 2
+  requests (1 try + 1 retry) in its entire lifetime, then exits — nothing
+  to amortize a persistent connection across. The TLS/TCP handshake cost
+  per invocation is the one thing this design gives up vs. a pooled
+  daemon, and at ~14/s it's immaterial (§2's `TIME_WAIT` math).
+- **Bounded timeout + small retry budget, not a breaker.** A circuit
+  breaker's job is protecting a *shared* resource (a pool, a worker budget)
+  from being exhausted by a sick dependency — there's no shared resource
+  here to protect. Each process independently bounds its own worst case
+  to ~300–400ms (below) and moves on; at N≈4, even every single in-flight
+  request timing out simultaneously is a non-event for the host.
+- **Local dead-letter file, not a live spool/replay queue.** Nothing
+  needs draining in real time — there's no daemon to crash or restart,
+  and no backlog to build (§2: concurrency never gets high enough to
+  create one). The file is a last-resort, operator-inspectable record of
+  what failed and why; see §7 for why automatic replay usually isn't even
+  necessary.
 
-1. **Script wall-time** (what the Gateway host/effect timeout sees):
-   fork/exec + a static Go binary's own start (measured well under 1 ms,
-   vs. tens of ms for a scripting-language interpreter — see the README)
-   + env parsing (µs) + UDS write/ack (~1–5 ms, local socket) ≈ **well
-   under 500 ms, and independent of the EMS's health** — this is the
-   actual win: Gateway never waits on the network call.
-2. **End-to-end delivery latency** (trigger → EMS ack), budgeted under
-   500 ms P99: per-attempt timeout 150 ms (connect+read) → one retry with
-   ~50–150 ms jittered backoff → worst case ~350–400 ms for two attempts,
-   leaving margin. A breaker that's already open skips straight to the
-   spool instead of spending the budget on a call likely to fail.
+### The latency budget, sized
 
-Concurrency sizing (Little's Law, §2): **N ≈ 1,000/s × 0.15 s ≈ 150**
-in-flight requests needed to sustain peak within the per-attempt budget; the
-daemon runs a pooled client with headroom (`ITRS_RELAY_WORKERS = 200`,
-`MaxIdleConnsPerHost ≈ 200`).
+One clock now, not two: fork/exec + a static Go binary's own start
+(sub-millisecond — see the README) + env parsing (µs) + the HTTP attempt(s)
+≈ **well under 500 ms**. Per-attempt timeout 150 ms (connect+read) → one
+retry with ~50–100 ms jittered backoff → worst case ~350–400 ms for two
+full-timeout attempts, leaving margin under the SLA — same numbers the
+original design used for its per-attempt budget, just now the *only*
+budget instead of one of two.
+
+Concurrency sizing (Little's Law, §2): **N ≈ 14/s × 0.3 s ≈ 4** at
+sustained peak, ≈42 even at a 10× stress margin — both trivially below any
+level where pooling, a worker limit, or backpressure would change the
+outcome. See `benchmark/BENCHMARK.md` Test A for the measured latency
+curve confirming this holds in practice, not just in the formula.
 
 ## 5. Data model
 
-No datastore in the hot path by design (`messaging-streaming`: don't add
-persistence the requirement doesn't call for). The only on-disk structures:
+No datastore in the hot path (`messaging-streaming`: don't add persistence
+the requirement doesn't call for) — and now no live queue/spool either,
+since there's no daemon to crash-recover or backlog to buffer. The one
+on-disk structure:
 
-- **Spool file** (`pending.jsonl`) — append-only, one JSON record per line,
-  each record written with a single `write()` under `PIPE_BUF` (4096 B) so
-  POSIX guarantees the append is atomic even with many concurrent writers
-  (many `itrs-notify` processes falling back at once need no file locking).
-  Truncate the `attributes` blob rather than break this guarantee —
-  documented trade-off in the code (`internal/spool`, shared by both
-  binaries — safe to share in Go since it's compiled into each static
-  binary at build time, not deployed as a sibling file that could drift).
-- **DLQ file** (`dead_letter.jsonl`) — same shape plus `failure_reason` and
-  `attempts`, for events that exhausted retries or hit a permanent (4xx)
-  rejection. Operator-inspectable and replayable.
+- **Dead-letter file** (`dead_letter.jsonl`) — append-only, one JSON
+  record per line (envelope + `failure_reason` + `attempts`), each record
+  written with a single `write()` under `PIPE_BUF` (4096 B) so POSIX
+  guarantees the append is atomic even with many concurrent `itrs-notify`
+  processes writing at once, with no file locking needed. Truncate the
+  `attributes` blob rather than break this guarantee — documented
+  trade-off in the code (`internal/spool`).
 
-`event_id` (UUID4, minted in `itrs-notify`) is the natural primary key
-across every hop — spool line, queue item, DLQ record, and the
-`Idempotency-Key` the EMS sees — so a record can be traced end to end.
+`event_id` (UUID4, minted in `itrs-notify`) is the natural primary key —
+dead-letter record and the `Idempotency-Key` the EMS sees are the same
+value, so a record can be traced end to end even without a central store.
 
 ## 6. Key decisions & trade-offs
 
 | Decision | Solves | Worsens | Change it when |
 |---|---|---|---|
-| Split "collect" (per-trigger script) from "deliver" (long-running daemon) | Decouples Gateway-visible latency from EMS latency/availability; enables connection reuse, pooling, a shared circuit breaker | Two components to deploy/operate instead of one script; a new local IPC contract | Never, at this volume — the fork-per-trigger issue only worsens as rate grows |
-| UDS + disk-spool fallback for the hand-off | Script never blocks on the network; local socket write is ~ms regardless of EMS health | At-least-once only (ack = "queued," not "delivered"); a message can be duplicated across spool-replay + in-flight retry | An EMS-side dedupe on `Idempotency-Key` isn't available — then durability needs a stronger local guarantee |
-| Bounded in-memory queue, NACK-and-spool when full | Backpressure — a stalled EMS can't grow memory without bound or block new triggers | A full queue pushes load onto disk I/O; spool-drain adds recovery-path complexity | Sustained rate consistently exceeds spool disk throughput — then the daemon itself needs sharding across hosts |
-| Circuit breaker around the EMS call | Fails fast during an EMS outage instead of piling retries onto a dead endpoint | Adds a state machine to tune (open/half-open thresholds); can trip on a real but transient blip | Breaker flaps under normal jitter — loosen the error-rate threshold or lengthen the window |
+| One program, direct POST — no relay daemon, no connection pool, no queue, no breaker | Nothing to deploy/operate beyond one binary; no local IPC protocol; lowest possible latency path (no extra local hop) | Each process pays its own TLS/TCP handshake (no reuse across invocations); no shared backpressure if the EMS degrades fleet-wide | Sustained (not spiky) per-host rate climbs into the hundreds/sec, or burst analysis shows sustained high concurrency — see §8 for the actual threshold |
+| Bounded per-attempt timeout + 1 retry, local dead-letter file on failure | Fixes the one failure mode that doesn't improve with lower volume: an unresponsive backend hanging the process indefinitely | At-least-once only; a dead-letter record needs a human (or a Geneos re-trigger — see §7) to resolve, nothing drains it automatically | Automatic replay becomes necessary — then a lightweight periodic reader of the dead-letter file is cheaper to add than reintroducing a daemon |
 | Capture all `_`-prefixed env vars into `attributes`, map known ones by a table | Forward-compatible if the exact Geneos variable names are wrong or change across versions (this sandbox couldn't verify them live) | The mapped top-level fields may be empty/wrong until `varMap` is confirmed against a real Gateway | After the first live test — pin `varMap`, keep `attributes` as the safety net |
-| Go, static binaries (`CGO_ENABLED=0`), for both `itrs-notify` and `event-relay` | No interpreter/runtime version to match across ~80 hosts in different regions (the deciding factor — see the revision note); sub-ms process start vs. tens of ms for a scripting-language interpreter at up to 1,000 forks/s; stdlib `net/http` gives connection pooling for free, so `event-relay` also needs zero third-party dependencies | A compiled/typed language: a `varMap` fix or schema tweak needs a rebuild + redeploy of the binary, not a hand-edit on a live host; cross-compiling for any non-amd64 region needs a `GOOS`/`GOARCH` build matrix in CI | Never, given the 80-host constraint — the same environment-drift argument only gets stronger with more regions, not weaker |
+| Go, a single static binary (`CGO_ENABLED=0`) | No interpreter/runtime version to match across ~80 hosts in different regions — unaffected by the volume correction, since it was never a throughput argument | A compiled/typed language: a `varMap` fix or schema tweak needs a rebuild + redeploy, not a hand-edit on a live host; cross-compiling for any non-amd64 region needs a `GOOS`/`GOARCH` build matrix in CI | Never, given the 80-host constraint — the same environment-drift argument only gets stronger with more regions, not weaker |
 
 ## 7. Failure modes & degradation
 
-- **EMS is down or slow.** Per-attempt timeout bounds each call; capped
-  retry+jitter rides out a blip; the circuit breaker opens on sustained
-  failure and skips the network entirely, routing straight to the spool.
-  Gateway-visible latency is unaffected either way (§4) — the degradation is
-  *invisible upstream* and only shows up as growing spool/DLQ depth, which
-  is exactly what's alarmed on (§9).
-- **Relay daemon is down or restarting.** `itrs-notify`'s UDS connect fails
-  fast (short timeout) and falls back to the disk spool; no events are
-  lost, they're just delayed. On restart, the daemon's spool-drainer replays
-  the backlog through the same bounded queue/breaker path — no thundering
-  herd into the EMS, because replay respects the same backpressure as live
-  traffic.
+- **EMS is down or slow.** Per-attempt timeout bounds each call; one
+  capped retry+jitter rides out a blip; on exhausted retries or a
+  permanent rejection, the event lands in the dead-letter file and the
+  process exits normally. No breaker, because there's no shared resource
+  (pool, worker budget) a sick EMS could exhaust at this concurrency (§4)
+  — each process's worst case is bounded on its own.
+- **A Geneos alert condition that keeps re-evaluating true will typically
+  re-fire the Effect on the next cycle anyway** — so a delivery dropped
+  during a brief EMS blip often self-heals without any replay mechanism,
+  for exactly the kind of persistent condition (CPU high, disk full) this
+  design exists to report. This is a real mitigating factor specific to
+  Geneos's rule-evaluation model, not a universal excuse to skip
+  durability — confirm it holds for the rules this integration actually
+  covers (some are edge-triggered, not level-triggered) before relying on
+  it over the dead-letter file.
 - **Poison event** (a payload the EMS permanently rejects, e.g. malformed
-  attribute value → 4xx). Not retried — goes straight to the DLQ with the
-  rejection reason, so it can't blocking-loop the worker that picked it up
-  or waste retry budget (mirrors `messaging-streaming`'s poison-message
-  guidance).
-- **Disk fills up** (spool/DLQ growing faster than they drain). This is the
-  one true data-loss risk in the design and is deliberately not silently
+  attribute value → 4xx). Not retried — straight to the dead-letter file
+  with the rejection reason, so it doesn't waste the retry budget on a
+  request that will fail the same way every time.
+- **Disk fills up** (dead-letter file growing faster than anyone clears
+  it). The one true data-loss risk in this design, deliberately not
   papered over: `itrs-notify`'s write to a full disk returns an error, is
   caught, and logged to stderr — the event is dropped rather than hanging
-  the Gateway effect. Alarm on spool file size/age (§9) well before this
-  point.
-- **Gateway host itself is overloaded by process churn** (§8) — the
-  daemon/EMS are healthy but the Gateway can't fork fast enough. Choosing
-  Go for `itrs-notify` (§6) removes the interpreter-startup share of this
-  cost, but not the OS-level fork/exec cost itself — see §8 for what's
-  actually left to do if this shows up.
+  the Gateway effect. Alarm on the dead-letter file's size/age (§9) well
+  before this point; a sustained climb (not a brief spike) is the signal
+  something is actually wrong downstream, worth escalating past "a
+  Geneos rule will probably re-fire."
+- **Gateway host process-fork cost.** Not a concern at the real per-host
+  rate (§2: ~14 forks/s is trivial for any runtime) — kept here only to
+  note explicitly that it was reasoned about and dismissed, not missed.
 
 ## 8. Scale evolution
 
-Current bottleneck at 1,000 events/s: **process-creation overhead on the
-Gateway host**, not the network hop or the EMS (§2) — and choosing Go for
-`itrs-notify` (§6) addresses the *interpreter-startup* share of that cost,
-not the OS-level fork/exec syscall cost, which any external program pays
-regardless of language. At the next order of magnitude (10×, 10,000
-events/s):
-- 10,000 fork/exec calls/second is still meaningful kernel-side work (page
-  table setup, context switches) even with a sub-millisecond static binary.
-  If Gateway-host load starts tracking event rate rather than headroom,
-  the next lever isn't the trigger program's language (already addressed)
-  — it's whether Geneos offers any way to batch or hold a persistent
-  channel per Gateway instead of one process per trigger; if not, this
-  becomes a host-sizing conversation, not a code change.
-- If a single relay daemon's worker pool can't sustain the higher rate,
-  raise `ITRS_RELAY_WORKERS`/pool limits first (cheap); only shard into
-  multiple daemons per host (e.g. one per NUMA node / CPU group) if a
-  single process is provably the ceiling — Go's goroutines scale well
-  past the ~200 default before this becomes necessary.
-- If the EMS itself becomes the ceiling (rate-limits, 429s dominate), that's
-  a capacity conversation with the EMS owner, not something retries can fix
-  — the circuit breaker keeps the Gateway host healthy in the meantime by
-  shedding to the spool rather than hammering.
-- **Rolling out a binary fix across 80 hosts in multiple regions** is
-  itself an evolution point this design didn't have to solve when it was
-  "edit one Python file in place" — a build pipeline (CI cross-compiles
-  per `GOOS`/`GOARCH`, artifacts get pushed per region) becomes necessary
-  infrastructure, not optional polish, once a `varMap` or schema fix needs
-  to reach every host.
+This section now runs in the opposite direction from a typical "what
+breaks at 10×" write-up: the interesting threshold is the one that would
+bring back the complexity this revision removed, not one that adds more
+of the same.
 
-**Signal that it's time to evolve:** sustained (not spiky) spool/DLQ growth,
-or Gateway-host load average tracking event rate rather than headroom.
+**Bring back pooling/a relay/a breaker if:**
+- **Sustained per-host rate**, not a brief spike, climbs enough that
+  Little's Law's N stops rounding to "a handful" — roughly, once a
+  sustained rate implies **N ≳ 50–100** at the same ~300ms budget (so
+  sustained rates in the hundreds/sec per host), connection reuse and a
+  shared breaker start earning their complexity back. A one-off 10× burst
+  (§2, §4) is already covered without this — it's *sustained* rate that
+  matters, not a spike.
+- **Burst concurrency analysis says otherwise.** §2's Little's-Law math
+  assumes triggers are reasonably spread within a peak minute. If a single
+  correlated incident (one shared dependency tripping many rules on one
+  host in the same evaluation cycle) can realistically produce, say,
+  hundreds of simultaneous triggers on one host — not just 835 spread
+  across a minute — that's a different concurrency profile than this
+  design was checked against. Confirm the burst shape, not just the
+  per-minute aggregate, before ruling this out entirely (open question, §10).
+- **Automatic replay of the dead-letter file becomes a real requirement**
+  (§6, §7) — but try a lightweight periodic reader first; that's a much
+  smaller addition than a live daemon.
+
+**Signal that it's time to evolve:** the dead-letter file growing
+persistently rather than in brief bursts tied to a known incident, or
+Gateway-host load tracking event rate instead of headroom — both
+observable without new instrumentation (§9).
+
+**Rolling out a binary fix across 80 hosts in multiple regions** remains
+real infrastructure regardless of which side of this design wins — a
+build pipeline (CI cross-compiles per `GOOS`/`GOARCH`, Ansible deploys
+per host/region) is already in place (`examples/itrs-gateway-event-relay/ansible/`).
 
 ## 9. Observability (`observability`)
 
-RED framing on the relay daemon (it's the request-driven component):
-- **Rate** — events accepted (UDS) vs spooled-fallback vs sent-ok vs
-  sent-fail vs DLQ, per minute.
-- **Errors** — HTTP error class from the EMS (4xx vs 429/5xx), breaker
-  state transitions.
-- **Duration** — per-attempt latency (p50/p99) and end-to-end
-  trigger→ack latency, to check the 500 ms budget in production, not just
-  on paper.
+Much lighter than a daemon would need, since there's no live process
+state (queue depth, breaker state, worker saturation) to expose:
 
-USE framing on the two buffers, which is where a slow EMS actually shows up:
-**queue depth** and **oldest-message age** in the in-memory queue, and
-**spool/DLQ file size and age of oldest un-replayed line** — the single best
-early-warning signal per `messaging-streaming`, alarmed well before disk
-fills.
+- **Rate** — dead-letter writes per host per day/hour. At the real
+  volume, this should be rare; a sudden climb is the primary signal.
+- **Errors** — `failure_reason` values in the dead-letter file (transport
+  error vs. which HTTP status) — enough to tell "EMS was unreachable" from
+  "EMS rejected the payload" without needing a live metrics pipeline.
+- **Duration** — `ITRS_NOTIFY_DEBUG=1`'s per-invocation wall-time log, if
+  ever profiling against the 500ms SLA in production rather than just in
+  the benchmark.
+
+**The one thing worth alarming on:** dead-letter file size/age — age of
+the oldest unresolved entry is the best early-warning signal (same
+principle `messaging-streaming` gives for any durable-failure record,
+applied here to a file instead of a DLQ topic).
 
 ## 10. Open questions
 
 - **Exact Geneos env-var names** — verify against a live Gateway (this
   sandbox's network policy blocked `docs.itrsgroup.com` /
   `support.itrsgroup.com`); confirm `varMap` in `cmd/itrs-notify/main.go`.
-- **EMS auth scheme and idempotency support** — the contract in §3c assumes
+- **EMS auth scheme and idempotency support** — the contract in §3b assumes
   bearer-token auth and that the EMS honors `Idempotency-Key`; confirm, or
-  add an EMS-specific adapter in `cmd/event-relay`.
-- **Multiple Gateway hosts** — confirmed one relay daemon per host; if the
-  EMS needs a single, globally coordinated rate limit across hosts (rather
-  than each host independently pacing itself), that's a `consistency-
-  coordination` concern (shared limiter state) not addressed here.
+  add an EMS-specific adapter in `cmd/itrs-notify`.
+- **Burst concurrency shape, not just the per-minute peak.** §8 names the
+  specific scenario (a correlated incident firing many rules on one host
+  within the same evaluation cycle) that would matter more than the
+  835/min aggregate — worth checking against how this org's rules are
+  actually structured before treating this design as settled at scale.
 - **Are all 80 hosts `linux/amd64`?** The build in the README assumes it;
   any host on a different OS/architecture (e.g. `arm64`) just needs its own
   `GOOS`/`GOARCH` build in the same CI pipeline — confirm the fleet's
   architecture mix before assuming one build artifact covers all 80.
 - ~~Binary distribution mechanism~~ **Resolved: Ansible.** See
   `examples/itrs-gateway-event-relay/ansible/` — a role/playbook that
-  deploys both binaries and the systemd unit, rolled out in `serial: "10%"`
-  batches rather than to all ~80 hosts/regions in one play.
-- ~~Does `event-relay` need its own dedicated system user, separate from
-  whatever account Geneos's Effects (and so `itrs-notify`) run as?~~
-  **Resolved: no, not in this deployment.** An earlier draft gave the
-  daemon a separate dedicated account on general least-privilege grounds,
-  which then required a shared setgid spool directory to let both
-  accounts write it. Confirmed with the org: Geneos's own runtime account
-  is already minimal and dedicated, with no broader host access — so
-  `event-relay` runs as that *same* account instead, and the setgid
-  plumbing goes away entirely (plain owner-only `0750` spool dir, one
-  owner). If a future environment's Geneos account is broadly privileged
-  instead, revisit this — keep the daemon on its own minimal account
-  there and bring the setgid-group approach back (or a `sudo`-scoped
-  single-user variant), rather than inheriting whatever that account can
-  already touch.
+  deploys the binary and a small secrets file, rolled out in
+  `serial: "10%"` batches rather than to all ~80 hosts/regions in one play.
+- ~~Does the relay daemon need its own dedicated system user?~~
+  **Moot.** There's no relay daemon anymore (this revision) — see the
+  revision history at the top. `itrs-notify` simply runs as whatever
+  account Geneos's Effects already run as; no second account was ever a
+  live question once there's only one process.
+- **Does a persistent condition reliably re-fire the Effect on Geneos's
+  next evaluation cycle**, the way §7 assumes for self-healing a dropped
+  delivery during a brief EMS blip? True for level-triggered rules in the
+  general case, but confirm it for whichever specific rules this
+  integration covers — an edge-triggered rule wouldn't get the same
+  safety net, and would lean more on the dead-letter file actually being
+  checked.

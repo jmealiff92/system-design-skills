@@ -1,9 +1,9 @@
 // Package uuid provides a minimal, dependency-free UUIDv4 generator.
 //
-// Deliberately hand-rolled instead of pulling in google/uuid: this repo's
-// two binaries otherwise have zero third-party dependencies (see the
-// itrs-notify and event-relay package docs for why that matters across 80
-// heterogeneous Gateway hosts), and a UUIDv4 is ~10 lines over crypto/rand.
+// Deliberately hand-rolled instead of pulling in google/uuid: itrs-notify
+// otherwise has zero third-party dependencies (see its package doc for
+// why that matters across 80 heterogeneous Gateway hosts), and a UUIDv4
+// is ~10 lines over crypto/rand.
 package uuid
 
 import (

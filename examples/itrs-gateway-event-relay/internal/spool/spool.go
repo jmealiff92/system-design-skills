@@ -1,14 +1,16 @@
-// Package spool implements the one on-disk contract shared by itrs-notify
-// and event-relay: a single JSON object per line, written with one write(2)
-// syscall so POSIX's PIPE_BUF atomicity guarantee holds under many
-// concurrent writers (many short-lived itrs-notify processes, plus
-// event-relay's own breaker-open re-spool path) with no file locking.
+// Package spool implements the dead-letter-file contract for itrs-notify:
+// a single JSON object per line, written with one write(2) syscall so
+// POSIX's PIPE_BUF atomicity guarantee holds under many concurrent
+// writers (many short-lived itrs-notify processes on the same host can
+// append to the same file with no locking).
 //
-// Both binaries import this package, which is safe in Go precisely because
-// it doesn't create the operational risk the equivalent choice would in
-// the Python version of this design: the package is compiled *into* each
-// static binary at build time, not deployed as a sibling file that could
-// drift out of sync on one of 80 hosts.
+// An earlier version of this design also had a second binary
+// (event-relay) sharing this package for its own queue/replay spool —
+// see docs/design/itrs-gateway-event-script.md's revision history for
+// why that binary no longer exists. The package stayed a separate
+// internal package anyway: that's free in Go (compiled into the one
+// binary at build time, not a sibling file that could drift), and kept
+// the dead-letter-record format isolated from main.go's request logic.
 package spool
 
 import (

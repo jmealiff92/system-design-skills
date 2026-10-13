@@ -1,5 +1,5 @@
 ---
-- name: Deploy the ITRS Gateway -> EMS event relay
+- name: Deploy itrs-notify to the Geneos Gateway fleet
   hosts: itrs_gateway_hosts
   become: true
   # ~80 hosts across regions: never bet the whole fleet on one rollout.
@@ -8,4 +8,4 @@
   # single-host or single-region canary before widening.
   serial: "10%"
   roles:
-    - itrs_event_relay
+    - itrs_notify
