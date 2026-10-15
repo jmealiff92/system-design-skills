@@ -25,7 +25,7 @@ Endpoints we use:
 | `/rest/runCommand` | Run a command on exactly one target, e.g. `/GATEWAY:reloadSetup` on `/geneos/gateway[(@name="GW")]/directory` | Yes |
 | `/rest/setup/validate` | Pre-flight validation report | Yes |
 | `/rest/snapshot/dataview` | Dataview values, severity, snooze state (one dataview per call) | Yes |
-| `/rest/authorize` | Exchange SSO credentials for a token | Yes |
+| `/rest/authorize` | Not used: tokens come from the SSO Agent directly | Yes |
 | `/rest/gatewayinfo/timezone` | Cheap reachability and auth check | Yes |
 | `/rest/xpaths/match` | Resolve an XPath to matching items, with a `limit` (default 100) | No, used by ITRS's cordial library; available on all our gateways |
 | `/rest/xpaths/commandTargets` | Items a command can run on (dry run) | No, used by ITRS's cordial library |
@@ -83,7 +83,7 @@ Each choice below holds until the condition in the last column; the design's bre
 | Decision | Solves | Worsens | Change it when |
 | --- | --- | --- | --- |
 | Async jobs (202 + poll or SSE) | Full fan-out outlasts the 30s Route timeout; one slow gateway never blocks the caller | Callers must poll; job state to hold and expire | Most calls target 1–5 gateways and finish in seconds → add a synchronous path for small selectors |
-| Act as the caller (their SSO token) | Gateway permissions apply unchanged; audit names a real person | Token handling in our pod; a 300s token expires during long jobs | Refreshing a 300s token mid-job proves unworkable → service account plus our own permission checks |
+| Act as the caller (their SSO token) | Gateway permissions apply unchanged; audit names a real person | Token handling in our pod; each user's 1-day refresh token is held in pod memory | Security review rules out holding refresh tokens in the pod → service account plus our own permission checks |
 | One replica, jobs in memory | No database to run; simplest thing that works | Single point of failure; deploys and restarts lose running jobs | Availability target needs 2 replicas, or audit history must survive restarts → shared store |
 | Pod-wide semaphore (500) plus 1 call per gateway | Bounds load on every gateway and on our pod | A full-fleet job takes 8–15s or more; jobs queue behind each other | Load test shows gateways tolerate more, or jobs routinely wait → raise limits per operation |
 | Canary then waves for reloadSetup | A bad setup change stops after 5 gateways, not 2,000 | A full reload takes about 3–9 minutes, not seconds; a fault that misses every canary gateway reaches 200 more | Measured reload times show the pauses dominate → shorter pauses, never zero canary |
@@ -93,16 +93,18 @@ The fleet never exceeds 2,000 gateways, so growth will not force a second replic
 
 ## Authentication and transport security
 
-Callers send their own SSO credentials; the service exchanges them for a Gateway token and acts as that user on every call. Gateway command permissions therefore apply as they would in Active Console.
+Callers send their own SSO credentials; the service exchanges them at the SSO Agent for an access token and a refresh token, and acts as that user on every gateway call. Gateway command permissions therefore apply as they would in Active Console.
 
 Service roles (who may select `all` or run reloads) come from directory groups mapped in `values.yaml`; Gateway permissions still apply on top. Which groups is an open question.
 
 Credential and token handling:
 
-1. Credentials arrive over HTTPS only and are used once to call `/rest/authorize`.
-2. Credentials are never logged, never written to the job store, and dropped once the token is issued.
-3. Tokens are cached in pod memory per user until expiry, so repeat jobs do not re-authenticate. Tokens never go to Redis or a database.
-4. A token that expires mid-job triggers one re-authorisation, then a per-gateway `auth_failed` result.
+1. Credentials arrive over HTTPS only and are used once, to get an access token (300s) and a refresh token (1 day) from the SSO Agent.
+2. Credentials are never logged, never written to the job store, and dropped as soon as the tokens are issued.
+3. Both tokens are held in pod memory per user; they are never logged and never go to Redis or a database. One access token works on every gateway.
+4. The service renews the access token with the refresh token at about 240s, once per user however many of that user's jobs are running, so a long reload never meets an expired token.
+5. If a renewal fails, running jobs stop starting new calls: in-flight calls finish, a reload stops as it would at the 10% rule, and the remaining gateways report `auth_failed`. The caller signs in again.
+6. A service session lasts as long as its refresh token, at most 1 day. Signing out or a pod restart drops both tokens.
 
 Transport:
 
@@ -110,7 +112,7 @@ Transport:
 - Certificates are verified against the internal CA bundle, mounted from a ConfigMap or Secret. `verify=False` is never used.
 - A gateway that offers only HTTP, or presents a bad certificate, is reported as `tls_error`, never downgraded.
 
-Confirmed: one token is valid on every gateway that trusts the same SSO Agent, so a job needs one authorise call, not one per gateway. Tokens last 300s. Still unconfirmed: the header the token is sent in (see Open questions).
+Confirmed: one token is valid on every gateway that trusts the same SSO Agent, so a job needs one token, not one per gateway. Access tokens last 300s and are renewed with a 1-day refresh token from the SSO Agent. Still unconfirmed: the header the token is sent in (see Open questions).
 
 ## API surface
 
@@ -118,7 +120,8 @@ Every fleet operation is asynchronous: POST returns `202` with a `job_id`, and t
 
 | Method | Path | Body or purpose |
 | --- | --- | --- |
-| POST | `/v1/auth/token` | SSO credentials → service session for the caller |
+| POST | `/v1/auth/token` | SSO credentials → service session for the caller, valid up to 1 day |
+| DELETE | `/v1/auth/token` | Sign out: drop the caller's access and refresh tokens |
 | GET | `/v1/gateways` | Cached inventory and last-known readiness |
 | POST | `/v1/readiness` | `{selector}` → job |
 | POST | `/v1/setup/validate` | `{selector}` → job |
@@ -264,7 +267,7 @@ Every dependency failure ends as a per-gateway status or a clear job-level error
 | --- | --- | --- |
 | One gateway slow or down | Per-call timeout; read-only calls retry once with jitter | That gateway as `timeout` or `unreachable`; the rest of the job completes |
 | Many gateways down (network event) | Calls fail fast on connect timeout; a reload stops at the failure threshold | Job finishes early with most gateways `unreachable`; reload reports `skipped` for the rest |
-| SSO Agent down | Authorise fails once, then the job is rejected before any gateway call | `503` with `retryable: true`, not 1,500 `auth_failed` rows |
+| SSO Agent down | Sign-in fails: the job is rejected before any gateway call. A renewal fails mid-job: no new calls start | `503` with `retryable: true`, not 1,500 `auth_failed` rows |
 | Inventory API down | Serve the last good copy, flagged with its age | Results carry `inventory_as_of`; unknown names are `not_found` |
 | Pod restart or deploy | Drain on SIGTERM; reloads stop at a wave boundary | Running jobs are lost after the grace period; `GET /jobs/{id}` returns `404` and the caller re-runs |
 | Reload call times out | Never retried; counted as a failure toward the threshold | `timeout` with outcome unknown; check the gateway before re-running |
@@ -310,7 +313,7 @@ Testing:
 - **Unit and API tests** with `pytest` and `pytest-asyncio`; gateway HTTP mocked with `respx`, covering every result status.
 - **Fake gateway service:** a small FastAPI app that mimics the REST responses, with configurable latency, errors and TLS behaviour.
 - **Load test** against 2,000 fake gateway endpoints, to set real concurrency, memory and CPU limits.
-- **Failure tests:** kill the pod mid-wave, stop the fake SSO Agent and inventory API, and retry a reload POST with the same key; each must match the failure table above.
+- **Failure tests:** kill the pod mid-wave, stop the fake SSO Agent and inventory API, expire an access token mid-reload, and retry a reload POST with the same key; each must match the failure table above.
 
 Rollout:
 
@@ -324,7 +327,7 @@ Rollout:
 
 The first three change the build, and each can be settled by testing one gateway.
 
-- [ ] **SSO token scope:** one token works on every gateway trusting the same SSO Agent and lasts 300s (confirmed). Still open: which header carries it? And a full reload (3–9 min) outlasts the token while credentials are dropped once it is issued, so how does a long job re-authorise?
+- [ ] **SSO token scope:** one access token works on every gateway trusting the same SSO Agent, lasts 300s, and is renewed with a 1-day refresh token from the SSO Agent (confirmed). Still open: which header carries it?
 - [x] **XPath match on 6.9:** does `/rest/xpaths/match` respond on our oldest gateways? Yes, available on all our gateways, though it is not in the public docs.
 - [ ] **REST disabled:** what does a gateway return when REST is off (404, connection refused, something else)?
 - [ ] **Per-file reload:** what does "reload 1, many or all files" mean, and is there a REST command for it? As far as we know, reloadSetup reloads the whole setup.
@@ -340,7 +343,7 @@ Risks:
 | --- | --- |
 | A bad setup change reloaded across the fleet | Validate first, canary, waves, stop at failure threshold, audit log |
 | The service overloads gateways | 1 in-flight call per gateway, per-request gateway cap, snapshot cache |
-| Credentials or tokens leak | Memory only, never logged or persisted, HTTPS only |
+| Credentials or tokens leak | Memory only, never logged or persisted, HTTPS only; credentials dropped after sign-in, tokens dropped on sign-out |
 | Large search results exhaust pod memory | Streaming NDJSON, pagination, size cap |
 | Undocumented endpoints change in a Gateway upgrade | Isolated in `GatewayClient`, covered by contract tests on each Gateway version in use |
 | A retried request or a second user starts an overlapping reload | Idempotency-Key on reload requests; 409 for overlapping reloads |
