@@ -140,6 +140,7 @@ Every fleet operation is asynchronous: POST returns `202` with a `job_id`, and t
 | GET | `/v1/jobs/{id}/events` | Server-sent events progress |
 | GET | `/v1/jobs/{id}/results` | NDJSON stream of every per-gateway result |
 | POST | `/v1/jobs/{id}/cancel` | Stop dispatching new gateway calls; in-flight calls finish and the rest report skipped |
+| POST | `/v1/jobs/{id}/rerun` | `{include_skipped?, validate_first?}` → a new reload job of the gateways that did not finish ok |
 
 `selector` is one of three forms:
 
@@ -233,6 +234,13 @@ Named canaries (`canary_gateways`) are checked before any reload:
 - **Ready.** A named canary that fails the readiness check rejects the job; the service never swaps in another gateway, because the caller chose those for a reason.
 - **1 to 20 gateways.** At least one, so no reload skips the canary; at most 20, so the canary stays small.
 - **Same stop rule.** Any failure among named canaries stops the job, as with the automatic ones.
+
+**Rerunning a reload.** `POST /v1/jobs/{id}/rerun` starts a new reload of only the gateways from a finished reload job that did not end `ok`, so fixing 50 failures does not mean reloading 1,950 gateways again:
+
+- **Included:** gateways that ended `error`, `timeout`, `busy`, `unreachable` or `auth_failed`. A `timeout` may already have reloaded; reloading it again is safe.
+- **Skipped gateways on request:** `include_skipped: true` adds gateways that ended `skipped`. That is how a `stopped` reload is finished once the setup is fixed.
+- **Same safety:** the new job runs the full rollout over the smaller set (readiness check, canary, stop rule) and its record links back to the original job.
+- **Same rules:** only the original job's owner or an admin can rerun it, the one-reload-at-a-time rule applies, and the 200-gateway cap applies without the admin role. A job with nothing left to rerun returns `400`.
 
 Estimated time for 2,000 gateways, by how long one reload takes:
 
