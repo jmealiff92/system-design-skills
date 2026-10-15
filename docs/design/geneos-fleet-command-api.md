@@ -134,6 +134,7 @@ Every fleet operation is asynchronous: POST returns `202` with a `job_id`, and t
 | POST | `/v1/commands/reload-setup` | `{selector, validate_first, canary_gateways?, max_failure_pct}` → job |
 | POST | `/v1/managed-entities/search` | `{selector, xpath_filter, limit}` → job |
 | POST | `/v1/dataviews/snapshot` | `{selector, managed_entity, sampler, dataview, probe?, sampler_type?, scope}` → job |
+| GET | `/v1/jobs` | The caller's own jobs, newest first; admins can add ?all=true to see every reload job |
 | GET | `/v1/jobs/{id}` | Summary counts plus per-gateway results, paginated |
 | GET | `/v1/jobs/{id}/events` | Server-sent events progress |
 | GET | `/v1/jobs/{id}/results` | NDJSON stream of every per-gateway result |
@@ -146,6 +147,8 @@ Every fleet operation is asynchronous: POST returns `202` with a `job_id`, and t
 - **Everything:** `{"all": true}`.
 
 An empty selector is rejected, so a blank request can never mean "all". The service turns every selector into a gateway list before any call, and the job records that list.
+
+Jobs are private to the person who started them. Reading, streaming or cancelling someone else's job returns `404`, so a job ID reveals nothing. Results hold data fetched with the owner's SSO token, so showing them to another user would get round Gateway permissions. One exception: users with the admin role can see and cancel any reload job's status, so a runaway reload can always be stopped by someone on duty.
 
 Mutating requests (`reload-setup`) require an `Idempotency-Key` header, kept for 24h: a retried POST returns the original `job_id` instead of starting a second fleet reload. A reload whose gateways overlap a running reload is rejected with `409 Conflict`. Throttled requests get `429` with `Retry-After`, and every error uses one envelope: `{code, message, request_id, retryable}`.
 
@@ -341,7 +344,7 @@ The first three change the build, and each can be settled by testing one gateway
 - [x] **XPath match on 6.9:** does `/rest/xpaths/match` respond on our oldest gateways? Yes, available on all our gateways, though it is not in the public docs.
 - [ ] **REST disabled:** what does a gateway return when REST is off (404, connection refused, something else)?
 - [ ] **Per-file reload:** what does "reload 1, many or all files" mean, and is there a REST command for it? As far as we know, reloadSetup reloads the whole setup.
-- [ ] **Shared store:** Oracle is available and Redis may be; v1 needs neither (see Job state and persistence). Is a single replica acceptable to start?
+- [x] **Shared store:** Oracle is available and Redis may be; v1 needs neither (see Job state and persistence). v1 starts on a single replica (agreed).
 - [ ] **REST coverage:** how many gateways already have REST enabled?
 - [ ] **Usage and availability:** how many users and jobs per day, and does anyone need the service during a deploy? This decides whether one replica is enough.
 - [ ] **Service roles:** which directory groups may select all gateways or run reloads?
@@ -359,3 +362,4 @@ Risks:
 | A retried request or a second user starts an overlapping reload | Idempotency-Key on reload requests; 409 for overlapping reloads |
 | Pod restart or deploy mid-reload | Drain to the end of the wave, Recreate strategy, audit log of each gateway reloaded |
 | One full-fleet job starves other users | Per-job cap of 250 call slots out of the pod's 500 |
+| One user reads results fetched with another user's token | Jobs are owner-only and return 404 to anyone else; admins see reload status only |
