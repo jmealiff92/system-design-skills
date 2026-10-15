@@ -152,6 +152,8 @@ Jobs are private to the person who started them. Reading, streaming or cancellin
 
 Mutating requests (`reload-setup`) require an `Idempotency-Key` header, kept for 24h: a retried POST returns the original `job_id` instead of starting a second fleet reload. A reload whose gateways overlap a running reload is rejected with `409 Conflict`. Throttled requests get `429` with `Retry-After`, and every error uses one envelope: `{code, message, request_id, retryable}`.
 
+The `Idempotency-Key` is a value the caller generates, normally a UUID, once per intended reload, and resends unchanged on every retry of that request. The service keeps each key for 24h, scoped to the caller: the same key with the same body returns the original `job_id`; the same key with a different body is rejected with `422`. Keys live in pod memory, so they do not survive a restart, but neither does the job they point at.
+
 The service builds each gateway's XPath itself. Callers supply only the part after `/directory`; for example `/probe/managedEntity[(attr("Env")="PROD")]` becomes `/geneos/gateway[(@name="GW1")]/directory/probe/managedEntity[(attr("Env")="PROD")]`.
 
 Each per-gateway result has the same shape:
@@ -166,7 +168,7 @@ Each per-gateway result has the same shape:
 }
 ```
 
-`status` is one of `ok`, `error`, `not_found`, `ambiguous_target`, `timeout`, `auth_failed`, `tls_error`, `rest_disabled`, `unreachable` or `skipped` (validation failed, or the wave stopped).
+`status` is one of `ok`, `error`, `not_found`, `ambiguous_target`, `timeout`, `auth_failed`, `tls_error`, `rest_disabled`, `unreachable`, `busy` (waited too long behind another call to that gateway) or `skipped` (validation failed, or the wave stopped).
 
 For `reloadSetup`, `timeout` means the outcome is unknown: the reload may have run. Mutating calls are never retried automatically. Read-only calls retry once on a connection error, after a jittered delay.
 
@@ -241,6 +243,44 @@ Estimated time for 2,000 gateways, by how long one reload takes:
 | 60s | ~8.5 min |
 
 That is about 2.3 minutes of fixed time (readiness check and two pauses) plus 6 rounds of reload time; validate-first adds 30–60s. The spike in rollout step 1 measures the real reload time.
+
+## Job lifecycle
+
+An accepted job runs at once as an asyncio task inside the pod. There is no queue or broker; the only waiting is for gateway-call slots.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Admission: POST request
+    Admission --> Refused: 429, 409 or 422 (no job created)
+    Admission --> running: 202 + job_id
+    running --> succeeded: every gateway ok
+    running --> completed_with_errors: ran to the end, some failed
+    running --> stopped: reload hit the stop rule
+    running --> cancelled: by the owner or an admin
+    running --> failed: error inside the service
+```
+
+A pod restart loses running jobs. Finished jobs are kept 24h or the last 500, then dropped.
+
+**Admission.** `POST` checks the session, the caller's role and, for reloads, the idempotency key. Then it checks the limits: 5 jobs per user and 10 per pod, else `429` with `Retry-After`; a reload overlapping a running one gets `409`. The selector becomes a gateway list from the cached inventory, the job is stored in memory as `running`, and the caller gets `202` with the `job_id`. A job that cannot start is refused rather than held, because a held job would be lost on a restart anyway.
+
+**The three gates.** Each gateway gets one coroutine, which passes three gates in this order before making its call:
+
+| Gate | Limit | Protects |
+| --- | --- | --- |
+| Gateway lock | 1 call per gateway at a time | The gateways |
+| Job slots | 250 calls; 450 for a reload | Other users' jobs |
+| Pod slots | 500 calls, of which reloads may use 450 | The pod, and 50 slots for reads |
+
+- The gateway lock comes first, so a call waiting behind another call to the same gateway does not hold a slot it cannot use. Every coroutine takes the gates in the same order, so they cannot deadlock.
+- Waiting for a gateway lock counts toward that gateway's deadline. If it runs out, the result is `busy`, so a read never hangs behind someone else's reload.
+- Waiters are served first come, first served; the per-job cap stops one large job holding the line.
+- Each result is written to the job and pushed to every open events stream, through one `asyncio.Queue` per subscriber.
+
+**Reloads** add a controller that runs the rollout steps in order, checks the stop rule on every result, and checks for cancel or shutdown before starting each new call.
+
+**Clean-up.** A background task runs every minute and drops finished jobs after 24h, or beyond the last 500. During shutdown, new jobs get `503`; draining is described below.
 
 ## Job state and persistence
 
