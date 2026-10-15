@@ -87,6 +87,7 @@ Each choice below holds until the condition in the last column; the design's bre
 | One replica, jobs in memory | No database to run; simplest thing that works | Single point of failure; deploys and restarts lose running jobs | Availability target needs 2 replicas, or job history must survive restarts → Oracle as the shared store |
 | Pod-wide semaphore (500) plus 1 call per gateway | Bounds load on every gateway and on our pod | A full-fleet job takes 8–15s or more; jobs queue behind each other | Load test shows gateways tolerate more, or jobs routinely wait → raise limits per operation |
 | Canary then waves for reloadSetup | A bad setup change stops after 5 gateways, not 2,000 | A full reload takes about 3–9 minutes, not seconds; a fault that misses every canary gateway reaches 200 more | Measured reload times show the pauses dominate → shorter pauses, never zero canary |
+| One reload at a time, service-wide | One rollout to watch, a simple audit trail, and safe retries without an idempotency key | Two teams cannot reload different environments together; the second waits 3–9 minutes | Teams routinely wait on each other → allow reloads on separate gateways, sharing the 450 reload slots |
 | JSON responses, not the gateway's SSE stream | One parsing path; simpler tests | No live per-gateway output during a long command | Commands that run for minutes need live output → consume the gateway stream |
 
 The fleet never exceeds 2,000 gateways, so growth will not force a second replica; an availability target or durable job history would.
@@ -150,9 +151,7 @@ An empty selector is rejected, so a blank request can never mean "all". The serv
 
 Jobs are private to the person who started them. Reading, streaming or cancelling someone else's job returns `404`, so a job ID reveals nothing. Results hold data fetched with the owner's SSO token, so showing them to another user would get round Gateway permissions. One exception: users with the admin role can see and cancel any reload job's status, so a runaway reload can always be stopped by someone on duty.
 
-Mutating requests (`reload-setup`) require an `Idempotency-Key` header, kept for 24h: a retried POST returns the original `job_id` instead of starting a second fleet reload. A reload whose gateways overlap a running reload is rejected with `409 Conflict`. Throttled requests get `429` with `Retry-After`, and every error uses one envelope: `{code, message, request_id, retryable}`.
-
-The `Idempotency-Key` is a value the caller generates, normally a UUID, once per intended reload, and resends unchanged on every retry of that request. The service keeps each key for 24h, scoped to the caller: the same key with the same body returns the original `job_id`; the same key with a different body is rejected with `422`. Keys live in pod memory, so they do not survive a restart, but neither does the job they point at.
+Only one reload runs at a time across the whole service. A reload request while another is running is rejected with `409 Conflict`, and the response names the running job's `job_id`, who started it and when. That also makes a retried request safe without an idempotency key: a retry that arrives while the first reload is running gets `409` with the first job's `job_id`, so a script can follow that job instead. Throttled requests get `429` with `Retry-After`, and every error uses one envelope: `{code, message, request_id, retryable}`.
 
 The service builds each gateway's XPath itself. Callers supply only the part after `/directory`; for example `/probe/managedEntity[(attr("Env")="PROD")]` becomes `/geneos/gateway[(@name="GW1")]/directory/probe/managedEntity[(attr("Env")="PROD")]`.
 
@@ -190,6 +189,7 @@ Limits, in order of importance:
 | --- | --- | --- |
 | Exact names only for dataview snapshots | No wildcards | Bounds a snapshot to one call per gateway |
 | Gateways per reload request | 200 without the admin role; more, including `all` or a whole environment, needs it | Stops one reload hitting the whole estate by accident. Read-only operations have no cap, and any user may select all |
+| Reloads running at once | 1 across the service | One rollout and one stop rule to watch at a time; the 409 names the running job |
 | In-flight calls per gateway, across all users | 1 | Protects gateways from us |
 | Concurrent jobs per user | 5 | Fair share between users |
 | Job submissions per user | 30 per minute | Stops scripted hammering; job reads have a separate, looser limit so polling a job is never throttled |
@@ -252,7 +252,7 @@ An accepted job runs at once as an asyncio task inside the pod. There is no queu
 stateDiagram-v2
     direction LR
     [*] --> Admission: POST request
-    Admission --> Refused: 429, 409 or 422 (no job created)
+    Admission --> Refused: 429 or 409 (no job created)
     Admission --> running: 202 + job_id
     running --> succeeded: every gateway ok
     running --> completed_with_errors: ran to the end, some failed
@@ -263,7 +263,7 @@ stateDiagram-v2
 
 A pod restart loses running jobs. Finished jobs are kept 24h or the last 500, then dropped.
 
-**Admission.** `POST` checks the session, the caller's role and, for reloads, the idempotency key. Then it checks the limits: 5 jobs per user and 10 per pod, else `429` with `Retry-After`; a reload overlapping a running one gets `409`. The selector becomes a gateway list from the cached inventory, the job is stored in memory as `running`, and the caller gets `202` with the `job_id`. A job that cannot start is refused rather than held, because a held job would be lost on a restart anyway.
+**Admission.** `POST` checks the session, the caller's role, then the limits: 5 jobs per user and 10 per pod, else `429` with `Retry-After`; a reload while another reload is running gets `409`. The selector becomes a gateway list from the cached inventory, the job is stored in memory as `running`, and the caller gets `202` with the `job_id`. A job that cannot start is refused rather than held, because a held job would be lost on a restart anyway.
 
 **The three gates.** Each gateway gets one coroutine, which passes three gates in this order before making its call:
 
@@ -298,7 +298,7 @@ v1 needs no database. We add a shared store only when one of these becomes true:
 - Jobs must survive restarts and deploys. (Audit history already does, through log aggregation.)
 - Two jobs must be prevented from hitting the same gateway across replicas.
 
-If that happens, the store is the Oracle database we already run. Jobs, idempotency keys and per-gateway leases are a few small rows per job at a handful of jobs a minute, well within what Oracle handles, and a row lock (`SELECT … FOR UPDATE SKIP LOCKED`) is enough to stop two replicas calling the same gateway at once.
+If that happens, the store is the Oracle database we already run. Jobs, the running-reload flag and per-gateway leases are a few small rows per job at a handful of jobs a minute, well within what Oracle handles, and a row lock (`SELECT … FOR UPDATE SKIP LOCKED`) is enough to stop two replicas calling the same gateway at once.
 
 Redis is needed in one case only: service sessions shared between replicas. SSO tokens are never written to Oracle, so with two replicas either sessions live in Redis, encrypted, or a caller whose request lands on the other pod signs in again. Until there are two replicas, neither applies.
 
@@ -366,7 +366,7 @@ Testing:
 - **Unit and API tests** with `pytest` and `pytest-asyncio`; gateway HTTP mocked with `respx`, covering every result status.
 - **Fake gateway service:** a small FastAPI app that mimics the REST responses, with configurable latency, errors and TLS behaviour.
 - **Load test** against 2,000 fake gateway endpoints, to set real concurrency, memory and CPU limits.
-- **Failure tests:** kill the pod mid-wave, stop the fake SSO Agent and inventory API, expire an access token mid-reload, and retry a reload POST with the same key; each must match the failure table above.
+- **Failure tests:** kill the pod mid-wave, stop the fake SSO Agent and inventory API, expire an access token mid-reload, and send a second reload while one is running; each must match the failure table above.
 
 Rollout:
 
@@ -399,7 +399,7 @@ Risks:
 | Credentials or tokens leak | Memory only, never logged or persisted, HTTPS only; credentials dropped after sign-in, tokens dropped on sign-out |
 | Large search results exhaust pod memory | Streaming NDJSON, pagination, size cap |
 | Undocumented endpoints change in a Gateway upgrade | Isolated in `GatewayClient`, covered by contract tests on each Gateway version in use |
-| A retried request or a second user starts an overlapping reload | Idempotency-Key on reload requests; 409 for overlapping reloads |
+| A retried request or a second user starts another reload | One reload at a time; a second request gets 409 naming the running job |
 | Pod restart or deploy mid-reload | Drain to the end of the wave, Recreate strategy, audit log of each gateway reloaded |
 | One full-fleet job starves other users | Per-job cap of 250 call slots out of the pod's 500 |
 | One user reads results fetched with another user's token | Jobs are owner-only and return 404 to anyone else; admins see reload status only |
