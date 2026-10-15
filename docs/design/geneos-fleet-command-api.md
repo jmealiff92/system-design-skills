@@ -95,6 +95,12 @@ The fleet never exceeds 2,000 gateways, so growth will not force a second replic
 
 Callers send their own SSO credentials; the service exchanges them at the SSO Agent for an access token and a refresh token, and acts as that user on every gateway call. Gateway command permissions therefore apply as they would in Active Console.
 
+Callers sign in to this service with FastAPI's built-in OAuth2 password flow, which also gives Swagger UI's Authorize button at `/docs`:
+
+- `POST /v1/auth/token` takes `username` and `password` as form fields (`OAuth2PasswordRequestForm`) and returns `{"access_token", "token_type": "bearer", "expires_in"}`.
+- That `access_token` is an opaque service session id, not the SSO token. It maps to the caller's SSO tokens in pod memory, so the SSO refresh token never leaves the pod and a session survives each 300s SSO renewal.
+- Every other endpoint takes the session as `Authorization: Bearer <session>`, checked by `OAuth2PasswordBearer(tokenUrl="/v1/auth/token")`. Scripts use the same two calls as the button.
+
 Service roles (who may select `all` or run reloads) come from directory groups mapped in `values.yaml`; Gateway permissions still apply on top. Which groups is an open question.
 
 Credential and token handling:
@@ -112,7 +118,7 @@ Transport:
 - Certificates are verified against the internal CA bundle, mounted from a ConfigMap or Secret. `verify=False` is never used.
 - A gateway that offers only HTTP, or presents a bad certificate, is reported as `tls_error`, never downgraded.
 
-Confirmed: one token is valid on every gateway that trusts the same SSO Agent, so a job needs one token, not one per gateway. Access tokens last 300s and are renewed with a 1-day refresh token from the SSO Agent. Still unconfirmed: the header the token is sent in (see Open questions).
+Confirmed: one token is valid on every gateway that trusts the same SSO Agent, so a job needs one token, not one per gateway. Access tokens last 300s and are renewed with a 1-day refresh token from the SSO Agent. Gateways take it in an Authorization: Bearer header.
 
 ## API surface
 
@@ -120,7 +126,7 @@ Every fleet operation is asynchronous: POST returns `202` with a `job_id`, and t
 
 | Method | Path | Body or purpose |
 | --- | --- | --- |
-| POST | `/v1/auth/token` | SSO credentials → service session for the caller, valid up to 1 day |
+| POST | `/v1/auth/token` | Form fields username and password → {access_token, token_type, expires_in}: a service session, valid up to 1 day |
 | DELETE | `/v1/auth/token` | Sign out: drop the caller's access and refresh tokens |
 | GET | `/v1/gateways` | Cached inventory and last-known readiness |
 | POST | `/v1/readiness` | `{selector}` → job |
@@ -317,7 +323,7 @@ Testing:
 
 Rollout:
 
-1. Spike on one real gateway: confirm what a REST-disabled gateway returns, the header the SSO token is sent in, and how long reloadSetup takes on a small and a large setup.
+1. Spike on one real gateway: confirm what a REST-disabled gateway returns, and how long reloadSetup takes on a small and a large setup.
 2. Ship the readiness report and fleet validate; run readiness across the estate to get the list of gateways still needing REST enabled.
 3. Enable REST on the remaining gateways through the normal config route, tracked from the readiness report.
 4. Ship reloadSetup against a non-production group, then production with canary and waves.
@@ -327,7 +333,7 @@ Rollout:
 
 The first three change the build, and each can be settled by testing one gateway.
 
-- [ ] **SSO token scope:** one access token works on every gateway trusting the same SSO Agent, lasts 300s, and is renewed with a 1-day refresh token from the SSO Agent (confirmed). Still open: which header carries it?
+- [x] **SSO token scope:** one access token works on every gateway trusting the same SSO Agent, lasts 300s, and is renewed with a 1-day refresh token from the SSO Agent and is sent to gateways as Authorization: Bearer (confirmed).
 - [x] **XPath match on 6.9:** does `/rest/xpaths/match` respond on our oldest gateways? Yes, available on all our gateways, though it is not in the public docs.
 - [ ] **REST disabled:** what does a gateway return when REST is off (404, connection refused, something else)?
 - [ ] **Per-file reload:** what does "reload 1, many or all files" mean, and is there a REST command for it? As far as we know, reloadSetup reloads the whole setup.
