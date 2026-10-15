@@ -84,7 +84,7 @@ Each choice below holds until the condition in the last column; the design's bre
 | --- | --- | --- | --- |
 | Async jobs (202 + poll or SSE) | Full fan-out outlasts the 30s Route timeout; one slow gateway never blocks the caller | Callers must poll; job state to hold and expire | Most calls target 1–5 gateways and finish in seconds → add a synchronous path for small selectors |
 | Act as the caller (their SSO token) | Gateway permissions apply unchanged; audit names a real person | Token handling in our pod; each user's 1-day refresh token is held in pod memory | Security review rules out holding refresh tokens in the pod → service account plus our own permission checks |
-| One replica, jobs in memory | No database to run; simplest thing that works | Single point of failure; deploys and restarts lose running jobs | Availability target needs 2 replicas, or audit history must survive restarts → shared store |
+| One replica, jobs in memory | No database to run; simplest thing that works | Single point of failure; deploys and restarts lose running jobs | Availability target needs 2 replicas, or job history must survive restarts → Oracle as the shared store |
 | Pod-wide semaphore (500) plus 1 call per gateway | Bounds load on every gateway and on our pod | A full-fleet job takes 8–15s or more; jobs queue behind each other | Load test shows gateways tolerate more, or jobs routinely wait → raise limits per operation |
 | Canary then waves for reloadSetup | A bad setup change stops after 5 gateways, not 2,000 | A full reload takes about 3–9 minutes, not seconds; a fault that misses every canary gateway reaches 200 more | Measured reload times show the pauses dominate → shorter pauses, never zero canary |
 | JSON responses, not the gateway's SSE stream | One parsing path; simpler tests | No live per-gateway output during a long command | Commands that run for minutes need live output → consume the gateway stream |
@@ -249,11 +249,15 @@ In-memory is acceptable while all of these hold:
 - Losing in-flight jobs on a pod restart is acceptable; the caller re-runs them, and `reloadSetup` is safe to repeat. A restart mid-reload loses wave progress, so the re-run starts again from the canary.
 - Large results are streamed or paginated, not held whole.
 
-We move to a shared store (Postgres if the cluster already runs it, otherwise Redis) when any of these become true:
+v1 needs no database. We add a shared store only when one of these becomes true:
 
 - Two replicas for availability, because `GET /jobs/{id}` may land on the pod that does not hold the job.
-- Jobs or audit history must survive restarts and deploys.
+- Jobs must survive restarts and deploys. (Audit history already does, through log aggregation.)
 - Two jobs must be prevented from hitting the same gateway across replicas.
+
+If that happens, the store is the Oracle database we already run. Jobs, idempotency keys and per-gateway leases are a few small rows per job at a handful of jobs a minute, well within what Oracle handles, and a row lock (`SELECT … FOR UPDATE SKIP LOCKED`) is enough to stop two replicas calling the same gateway at once.
+
+Redis is needed in one case only: service sessions shared between replicas. SSO tokens are never written to Oracle, so with two replicas either sessions live in Redis, encrypted, or a caller whose request lands on the other pod signs in again. Until there are two replicas, neither applies.
 
 Sticky sessions on the Route are not a substitute; they break on pod restarts.
 
@@ -337,7 +341,7 @@ The first three change the build, and each can be settled by testing one gateway
 - [x] **XPath match on 6.9:** does `/rest/xpaths/match` respond on our oldest gateways? Yes, available on all our gateways, though it is not in the public docs.
 - [ ] **REST disabled:** what does a gateway return when REST is off (404, connection refused, something else)?
 - [ ] **Per-file reload:** what does "reload 1, many or all files" mean, and is there a REST command for it? As far as we know, reloadSetup reloads the whole setup.
-- [ ] **Shared store:** does the cluster already run Postgres or Redis? Is a single replica acceptable to start?
+- [ ] **Shared store:** Oracle is available and Redis may be; v1 needs neither (see Job state and persistence). Is a single replica acceptable to start?
 - [ ] **REST coverage:** how many gateways already have REST enabled?
 - [ ] **Usage and availability:** how many users and jobs per day, and does anyone need the service during a deploy? This decides whether one replica is enough.
 - [ ] **Service roles:** which directory groups may select all gateways or run reloads?
