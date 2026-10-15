@@ -27,7 +27,7 @@ Endpoints we use:
 | `/rest/snapshot/dataview` | Dataview values, severity, snooze state (one dataview per call) | Yes |
 | `/rest/authorize` | Exchange SSO credentials for a token | Yes |
 | `/rest/gatewayinfo/timezone` | Cheap reachability and auth check | Yes |
-| `/rest/xpaths/match` | Resolve an XPath to matching items, with a `limit` (default 100) | No, used by ITRS's cordial library |
+| `/rest/xpaths/match` | Resolve an XPath to matching items, with a `limit` (default 100) | No, used by ITRS's cordial library; available on all our gateways |
 | `/rest/xpaths/commandTargets` | Items a command can run on (dry run) | No, used by ITRS's cordial library |
 
 Responses carry a `status` of `finished` or `error`, plus interleaved `stdout`, `stderr` and `execLog` streams, which we flatten per gateway. The gateway also offers a server-sent-events stream; v1 uses JSON only.
@@ -83,7 +83,7 @@ Each choice below holds until the condition in the last column; the design's bre
 | Decision | Solves | Worsens | Change it when |
 | --- | --- | --- | --- |
 | Async jobs (202 + poll or SSE) | Full fan-out outlasts the 30s Route timeout; one slow gateway never blocks the caller | Callers must poll; job state to hold and expire | Most calls target 1–5 gateways and finish in seconds → add a synchronous path for small selectors |
-| Act as the caller (their SSO token) | Gateway permissions apply unchanged; audit names a real person | Token handling in our pod; possibly 1,500 authorise calls per job | Tokens are per gateway and auth dominates job time → service account plus our own permission checks |
+| Act as the caller (their SSO token) | Gateway permissions apply unchanged; audit names a real person | Token handling in our pod; a 300s token expires during long jobs | Refreshing a 300s token mid-job proves unworkable → service account plus our own permission checks |
 | One replica, jobs in memory | No database to run; simplest thing that works | Single point of failure; deploys and restarts lose running jobs | Availability target needs 2 replicas, or audit history must survive restarts → shared store |
 | Pod-wide semaphore (500) plus 1 call per gateway | Bounds load on every gateway and on our pod | A full-fleet job takes 8–15s or more; jobs queue behind each other | Load test shows gateways tolerate more, or jobs routinely wait → raise limits per operation |
 | Canary then waves for reloadSetup | A bad setup change stops after 5 gateways, not 2,000 | A full reload takes about 3–9 minutes, not seconds; a fault that misses every canary gateway reaches 200 more | Measured reload times show the pauses dominate → shorter pauses, never zero canary |
@@ -110,7 +110,7 @@ Transport:
 - Certificates are verified against the internal CA bundle, mounted from a ConfigMap or Secret. `verify=False` is never used.
 - A gateway that offers only HTTP, or presents a bad certificate, is reported as `tls_error`, never downgraded.
 
-Unconfirmed: whether one token is valid on every gateway trusting the same SSO Agent, the header it is sent in, and its lifetime. If tokens are per gateway, a 1,500-gateway job needs 1,500 authorise calls (see Open questions).
+Confirmed: one token is valid on every gateway that trusts the same SSO Agent, so a job needs one authorise call, not one per gateway. Tokens last 300s. Still unconfirmed: the header the token is sent in (see Open questions).
 
 ## API surface
 
@@ -314,7 +314,7 @@ Testing:
 
 Rollout:
 
-1. Spike on one real gateway: confirm `/rest/xpaths/match` on 6.9, what a REST-disabled gateway returns, the SSO token behaviour, and how long reloadSetup takes on a small and a large setup.
+1. Spike on one real gateway: confirm what a REST-disabled gateway returns, the header the SSO token is sent in, and how long reloadSetup takes on a small and a large setup.
 2. Ship the readiness report and fleet validate; run readiness across the estate to get the list of gateways still needing REST enabled.
 3. Enable REST on the remaining gateways through the normal config route, tracked from the readiness report.
 4. Ship reloadSetup against a non-production group, then production with canary and waves.
@@ -324,8 +324,8 @@ Rollout:
 
 The first three change the build, and each can be settled by testing one gateway.
 
-- [ ] **SSO token scope:** is one token valid on every gateway that trusts the same SSO Agent? What header carries it, and how long does it last?
-- [ ] **XPath match on 6.9:** does `/rest/xpaths/match` respond on our oldest gateways? It is not in the public docs.
+- [ ] **SSO token scope:** one token works on every gateway trusting the same SSO Agent and lasts 300s (confirmed). Still open: which header carries it? And a full reload (3–9 min) outlasts the token while credentials are dropped once it is issued, so how does a long job re-authorise?
+- [x] **XPath match on 6.9:** does `/rest/xpaths/match` respond on our oldest gateways? Yes, available on all our gateways, though it is not in the public docs.
 - [ ] **REST disabled:** what does a gateway return when REST is off (404, connection refused, something else)?
 - [ ] **Per-file reload:** what does "reload 1, many or all files" mean, and is there a REST command for it? As far as we know, reloadSetup reloads the whole setup.
 - [ ] **Shared store:** does the cluster already run Postgres or Redis? Is a single replica acceptable to start?
